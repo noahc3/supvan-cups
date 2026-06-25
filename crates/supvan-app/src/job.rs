@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use ipp_printer_app::{JobFailure, JobOptions, PrinterHandle, PrinterReason, RasterDriver};
 use supvan_proto::bitmap::{DEFAULT_MARGIN_DOTS, center_in_printhead, raster_to_column_major};
-use supvan_proto::buffer::split_into_buffers;
+use supvan_proto::buffer::{ESeriesBufOpts, split_into_buffers, split_into_buffers_e};
 use supvan_proto::compress::compress_buffers;
 use supvan_proto::error::Error as ProtoError;
 use supvan_proto::speed::calc_speed;
@@ -16,6 +16,16 @@ use crate::printer_device::KsDevice;
 
 /// Maximum device print density; darkness (0-100%) scales onto 0..=MAX_DENSITY.
 const MAX_DENSITY: i32 = 15;
+
+/// Driver-family name (see `data/models.toml`) selecting the E-series print
+/// path. The E10pro family uses a distinct buffer/transfer protocol from the
+/// T50 (`docs/E_SERIES_PROTOCOL.md`).
+const ESERIES_DRIVER: &str = "supvan_e10pro";
+
+/// E-series burn-energy ceiling (byte 12 in the print-buffer header). Captured
+/// working value was 23; darkness 0-100% scales onto 0..=ESERIES_MAX_ENERGY,
+/// bypassing the T50 MAX_DENSITY=15 clamp that caused blank E-series output.
+const ESERIES_MAX_ENERGY: i32 = 31;
 
 /// Poll cadence and budget while waiting for print completion
 /// (COMPLETION_POLLS × COMPLETION_POLL_INTERVAL = 30s).
@@ -75,6 +85,42 @@ fn failure_from_proto(e: ProtoError, context: &str) -> JobFailure {
     JobFailure::new(reasons, format!("{context}: {e}"))
 }
 
+/// Pack column-major LSB-first raster into the E-series printhead width.
+///
+/// Unlike [`center_in_printhead`] (T50, which centers content in a fixed
+/// 384-dot canvas), the E10pro head is exactly `head_dots` wide (96) and the
+/// firmware rejects wider buffers. Content is LEFT-aligned and any dots past
+/// the head are truncated. Input is column-major LSB-first with
+/// `ceil(input_width_dots / 8)` bytes per column; output is `head_dots / 8`
+/// bytes per column (`head_dots` must be a multiple of 8). Returns
+/// `(column-major canvas, bytes_per_line)`.
+fn eseries_pack(
+    input: &[u8],
+    num_cols: u32,
+    input_width_dots: u32,
+    head_dots: u32,
+) -> (Vec<u8>, u32) {
+    let out_bpl = (head_dots / 8) as usize;
+    let in_bpl = input_width_dots.div_ceil(8) as usize;
+    let copy_dots = input_width_dots.min(head_dots);
+    let mut output = vec![0u8; num_cols as usize * out_bpl];
+
+    for col in 0..num_cols as usize {
+        let in_start = col * in_bpl;
+        let out_start = col * out_bpl;
+        for dot in 0..copy_dots as usize {
+            let in_byte = in_start + dot / 8;
+            if in_byte >= input.len() {
+                break;
+            }
+            if (input[in_byte] >> (dot % 8)) & 1 != 0 {
+                output[out_start + dot / 8] |= 1 << (dot % 8);
+            }
+        }
+    }
+    (output, out_bpl as u32)
+}
+
 pub struct KsJob {
     pub width: u32,
     pub height: u32,
@@ -84,6 +130,9 @@ pub struct KsJob {
     pub density: u8,
     pub printhead_width_dots: u32,
     pub pgm_acc: Option<PgmAccumulator>,
+    /// E-series (E10pro) burn energy (byte 12), derived from darkness. `Some`
+    /// selects the E-series buffer/transfer path; `None` is the T50 path.
+    pub eseries_energy: Option<u8>,
 }
 
 impl KsJob {
@@ -94,9 +143,10 @@ impl KsJob {
         bpl: u32,
         density: u8,
         printhead_width_dots: u32,
+        eseries_energy: Option<u8>,
     ) -> Result<Self, JobFailure> {
         log::info!(
-            "KsJob::start: {w}x{h}, bpl={bpl}, density={density}, printhead={printhead_width_dots}"
+            "KsJob::start: {w}x{h}, bpl={bpl}, density={density}, printhead={printhead_width_dots}, eseries_energy={eseries_energy:?}"
         );
         Ok(KsJob {
             width: w,
@@ -107,6 +157,7 @@ impl KsJob {
             density,
             printhead_width_dots,
             pgm_acc: None,
+            eseries_energy,
         })
     }
 
@@ -147,33 +198,60 @@ impl KsJob {
 
         let (col_data, num_cols, _) =
             raster_to_column_major(&self.raster_data, self.width, self.height);
-        let (canvas, canvas_bpl) =
-            center_in_printhead(&col_data, num_cols, self.width, self.printhead_width_dots);
+
+        // Pack into the printhead canvas. The E-series (E10pro) packs exactly
+        // `printhead_width_dots` (96) across with NO centering — its head
+        // rejects widths past 96 and the buffer ships exactly that many dots
+        // (`docs/E_SERIES_PROTOCOL.md`). The T50 centers content in its fixed
+        // 384-dot head canvas.
+        let (canvas, canvas_bpl) = if self.eseries_energy.is_some() {
+            eseries_pack(&col_data, num_cols, self.width, self.printhead_width_dots)
+        } else {
+            center_in_printhead(&col_data, num_cols, self.width, self.printhead_width_dots)
+        };
         dump.printhead_pbm(&canvas, num_cols, canvas_bpl, self.printhead_width_dots);
-
-        let buffers = split_into_buffers(
-            &canvas,
-            canvas_bpl as u8,
-            num_cols as u16,
-            DEFAULT_MARGIN_DOTS,
-            DEFAULT_MARGIN_DOTS,
-            self.density,
-        );
-
-        let (compressed, avg) = compress_buffers(&buffers)
-            .map_err(|e| JobFailure::other(format!("compression: {e}")))?;
-        let speed = calc_speed(avg);
 
         let outcome: Result<(), JobFailure> = if let Some(ref printer) = dev.printer {
             dev.printing.store(true, Ordering::Release);
-            let result = printer.print_compressed(&compressed, speed);
+            let result = if let Some(energy) = self.eseries_energy {
+                // E-series: ship all `num_cols` raster columns as image data
+                // (callers supply whitespace), build E-series buffers, and use
+                // the 0xD1/0xBB transfer path. Single page → print_eseries
+                // re-sends it via 0xBB to satisfy the two-stage handshake.
+                let opts = ESeriesBufOpts {
+                    energy,
+                    ..ESeriesBufOpts::default()
+                };
+                let buffers =
+                    split_into_buffers_e(&canvas, canvas_bpl as u8, num_cols as u16, opts);
+                printer.print_eseries(&[buffers], num_cols as u16)
+            } else {
+                let buffers = split_into_buffers(
+                    &canvas,
+                    canvas_bpl as u8,
+                    num_cols as u16,
+                    DEFAULT_MARGIN_DOTS,
+                    DEFAULT_MARGIN_DOTS,
+                    self.density,
+                    1,
+                );
+                let (compressed, avg) = match compress_buffers(&buffers) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        dev.printing.store(false, Ordering::Release);
+                        return Err(JobFailure::other(format!("compression: {e}")));
+                    }
+                };
+                let speed = calc_speed(avg);
+                printer.print_compressed(&compressed, speed)
+            };
             dev.printing.store(false, Ordering::Release);
             match result {
                 Ok(()) => Ok(()),
                 Err(ProtoError::InvalidResponse(msg)) => {
                     if let Ok(Some(s)) = printer.query_status() {
                         if s.has_error() {
-                            Err(failure_from_status(&s, "print_compressed"))
+                            Err(failure_from_status(&s, "print"))
                         } else {
                             Err(JobFailure::other(msg))
                         }
@@ -181,7 +259,7 @@ impl KsJob {
                         Err(JobFailure::other(msg))
                     }
                 }
-                Err(e) => Err(failure_from_proto(e, "print_compressed")),
+                Err(e) => Err(failure_from_proto(e, "print")),
             }
         } else {
             // Mock device: simulate the print delay, then check the simulator
@@ -271,7 +349,15 @@ impl RasterDriver for KsJob {
         let density = ((darkness * MAX_DENSITY + 50) / 100) as u8;
         let printhead_width_dots = printer.printhead_width_dots();
 
-        let mut ks = KsJob::start(dev, w, h, bpl, density, printhead_width_dots)?;
+        // E-series (E10pro) uses a distinct buffer/transfer path with an
+        // independent, unclamped energy byte; scale darkness onto its range.
+        let eseries_energy = if printer.driver_name() == ESERIES_DRIVER {
+            Some(((darkness * ESERIES_MAX_ENERGY + 50) / 100).clamp(0, ESERIES_MAX_ENERGY) as u8)
+        } else {
+            None
+        };
+
+        let mut ks = KsJob::start(dev, w, h, bpl, density, printhead_width_dots, eseries_energy)?;
         if options.bits_per_pixel == 8 && dumps_enabled() {
             ks.pgm_acc = Some(PgmAccumulator::new(w, h));
         }
@@ -322,5 +408,41 @@ impl RasterDriver for KsJob {
 
     fn end_job(self, dev: &Self::Device) {
         self.end(dev);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eseries_pack_left_aligns_into_head_width() {
+        // 2 columns, input 8 dots wide (1 byte/col), all set; head = 16 dots
+        // (2 bytes/col). Content left-aligns into the low byte, high byte is 0
+        // (NOT centered, unlike the T50 path).
+        let input = vec![0xFF, 0xFF];
+        let (out, bpl) = eseries_pack(&input, 2, 8, 16);
+        assert_eq!(bpl, 2);
+        assert_eq!(out, vec![0xFF, 0x00, 0xFF, 0x00]);
+    }
+
+    #[test]
+    fn eseries_pack_truncates_width_past_head() {
+        // Input 16 dots wide (2 bytes/col), all set; head = 8 dots (1 byte/col).
+        // Dots past the 8-dot head are dropped.
+        let input = vec![0xFF, 0xFF];
+        let (out, bpl) = eseries_pack(&input, 1, 16, 8);
+        assert_eq!(bpl, 1);
+        assert_eq!(out, vec![0xFF]);
+    }
+
+    #[test]
+    fn eseries_pack_preserves_lsb_first_bit_order() {
+        // Single column, dot 0 set only (LSB-first). 96-dot head = 12 bytes/col.
+        let input = vec![0x01];
+        let (out, bpl) = eseries_pack(&input, 1, 8, 96);
+        assert_eq!(bpl, 12);
+        assert_eq!(out[0], 0x01, "dot 0 stays in the LSB");
+        assert!(out[1..].iter().all(|&b| b == 0));
     }
 }

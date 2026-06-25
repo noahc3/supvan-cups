@@ -165,11 +165,13 @@ fn job_record(
 ///
 /// Plain synchronous — JPEG decode is sync and the device transfer is the same
 /// blocking path the raster job uses, so no tokio runtime is needed.
+#[allow(clippy::too_many_arguments)]
 pub fn run_jpeg_job(
     printer_name: &str,
     device_uri: &str,
     darkness: i32,
     printhead_width_dots: u32,
+    driver_name: &str,
     media_size_hmm: [i32; 2],
     jpeg: &[u8],
     copies: u32,
@@ -191,9 +193,15 @@ pub fn run_jpeg_job(
             format!("cannot open device {device_uri}"),
         )
     })?;
-    // The throwaway record only feeds KsJob's darkness + printhead width; the
-    // driver name is irrelevant on this path.
-    let record = job_record(printer_name, device_uri, "", printhead_width_dots, darkness);
+    // The throwaway record feeds KsJob's darkness + printhead width + driver
+    // name (the last selects the E-series vs T50 print path).
+    let record = job_record(
+        printer_name,
+        device_uri,
+        driver_name,
+        printhead_width_dots,
+        darkness,
+    );
     let handle = PrinterHandle { record: &record };
 
     // 8bpp grayscale, one byte per pixel; KsJob's 8bpp branch dithers each row.
@@ -338,5 +346,63 @@ mod tests {
         let (canvas, w, h) = fit_luma(&img, [0, 0], 384);
         assert!(canvas.is_empty());
         assert_eq!((w, h), (0, 0));
+    }
+
+    /// Live end-to-end test of the E-series IPP path against a real E10pro over
+    /// Bluetooth. Ignored by default; run with the printer powered on:
+    ///
+    ///   SUPVAN_LIVE_BT=A4:93:40:42:79:49 \
+    ///     cargo test --release -p supvan-app -- --ignored --nocapture live_eseries_jpeg
+    ///
+    /// Builds a small high-contrast 12x20 mm image, encodes it as JPEG, and
+    /// drives [`run_jpeg_job`] with the `supvan_e10pro` driver — the exact path
+    /// a CUPS `image/jpeg` job takes — exercising start_job's E-series energy
+    /// dispatch, transfer_page's `eseries_pack` + `split_into_buffers_e`, and
+    /// `print_eseries`. A successful run prints a non-blank label and returns
+    /// Ok; verify the print is non-blank and NOT doubled by eye.
+    #[test]
+    #[ignore = "requires a live E10pro over Bluetooth; set SUPVAN_LIVE_BT=<mac>"]
+    fn live_eseries_jpeg() {
+        let mac = std::env::var("SUPVAN_LIVE_BT")
+            .expect("set SUPVAN_LIVE_BT=<printer mac> to run this test");
+        let _ = env_logger::try_init();
+        crate::models::ensure_loaded();
+
+        // Register a supvan:// slug -> BT address so open_uri can resolve it.
+        let slug = "livetest";
+        crate::device::register_supvan(slug, None, Some(mac.clone()));
+        let uri = format!("supvan://{slug}");
+
+        // 96x160 px source (1 px = 1 dot at 12x20 mm, 8 dots/mm): a filled
+        // border + diagonal so a correct print is obviously non-blank and
+        // orientation is visible. Black = 0, white = 255.
+        let (w, h) = (96u32, 160u32);
+        let mut img = GrayImage::from_pixel(w, h, Luma([255]));
+        for y in 0..h {
+            for x in 0..w {
+                let border = x < 3 || x >= w - 3 || y < 3 || y >= h - 3;
+                let diag = (x * (h - 1) / w).abs_diff(y) < 2;
+                if border || diag {
+                    img.put_pixel(x, y, Luma([0]));
+                }
+            }
+        }
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageLuma8(img)
+            .write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+            .expect("jpeg encode");
+
+        // 12x20 mm media in hundredths of a mm; e10pro head = 96 dots.
+        let result = run_jpeg_job(
+            "livetest",
+            &uri,
+            80,                 // darkness 80% -> energy ~25
+            96,                 // printhead width dots
+            "supvan_e10pro",    // selects the E-series path
+            [1200, 2000],       // 12x20 mm
+            &jpeg,
+            1,
+        );
+        result.expect("E-series IPP jpeg job failed");
     }
 }

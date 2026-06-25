@@ -36,11 +36,31 @@ impl PrinterHandle {
         }
     }
 
-    /// Stream the compressed raster + speed to the device.
+    /// Stream the compressed raster + speed to the device (T50 path).
+    ///
+    /// T50 print flow uses START_PRINT param 0. The E-series (E10pro) uses a
+    /// distinct transfer protocol — see [`Self::print_eseries`].
     pub fn print_compressed(&self, compressed: &[u8], speed: u16) -> ProtoResult<()> {
         match self {
-            Self::Owned(p) => p.print_compressed(compressed, speed),
-            Self::Shared(arc) => arc.lock().unwrap().print_compressed(compressed, speed),
+            Self::Owned(p) => p.print_compressed(compressed, speed, 0),
+            Self::Shared(arc) => arc.lock().unwrap().print_compressed(compressed, speed, 0),
+        }
+    }
+
+    /// Run a full E-series (E10pro) print of pre-built print buffers.
+    ///
+    /// The E-series uses a distinct transfer path (0xD1/0xBB bulk framing,
+    /// independent energy byte, 96-dot head) from the T50 [`print_compressed`];
+    /// see [`Printer::print_eseries`] and `docs/E_SERIES_PROTOCOL.md`. The IPP
+    /// path packs a single page, so `pages` is a one-element slice.
+    pub fn print_eseries(
+        &self,
+        pages: &[Vec<[u8; supvan_proto::buffer::PRINT_BUF_SIZE]>],
+        total_feed_cols: u16,
+    ) -> ProtoResult<()> {
+        match self {
+            Self::Owned(p) => p.print_eseries(pages, total_feed_cols),
+            Self::Shared(arc) => arc.lock().unwrap().print_eseries(pages, total_feed_cols),
         }
     }
 

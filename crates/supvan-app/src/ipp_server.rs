@@ -302,6 +302,7 @@ pub async fn run_server(host: &str, port: u16) -> std::io::Result<()> {
                     &cfg.device_uri,
                     cfg.darkness,
                     cfg.printhead_width_dots,
+                    &cfg.driver_name,
                     media_size,
                     raster,
                     copies,
