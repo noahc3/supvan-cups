@@ -222,6 +222,21 @@ impl RfcommSocket {
         Ok(resp)
     }
 
+    /// Send an arbitrary-length command frame (e.g. the E-series `0xD0`/`0xB0`
+    /// setup frames whose param block exceeds the standard 4 bytes) and read
+    /// the response.
+    pub fn send_raw_frame(&self, frame: &[u8]) -> Result<Option<Vec<u8>>> {
+        log::debug!("TX: {:02x?}", frame);
+        self.write_chunked(frame, 512, Duration::from_millis(10))?;
+        let resp = self.read_response(Duration::from_secs(2), Duration::from_millis(20))?;
+        if let Some(ref data) = resp {
+            log::debug!("RX: {:02x?}", &data[..data.len().min(40)]);
+        } else {
+            log::debug!("RX: (no response)");
+        }
+        Ok(resp)
+    }
+
     /// Send a 512-byte data frame as 4x128-byte chunks with 10ms delay.
     pub fn send_data_frame(
         &self,

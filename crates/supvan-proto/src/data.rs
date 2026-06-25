@@ -73,6 +73,55 @@ pub fn build_data_frames(compressed: &[u8]) -> Vec<[u8; 512]> {
     frames
 }
 
+/// Build a single 512-byte E-series bulk frame (`0xD1` / `0xBB`).
+///
+/// Byte-verified layout (`docs/E_SERIES_PROTOCOL.md`):
+///   [0..2]  0x7E 0x5A
+///   [2..4]  0x01FC  (payload length = 508)
+///   [4..7]  0x10 0x02 0xAA  (command marker, same as a normal command frame)
+///   [7]     cmd  (0xD1 or 0xBB)
+///   [8..10] chunk checksum LE = sum of bytes [10..512] (= idx+tot+payload)
+///   [10]    chunk index (0-based)
+///   [11]    chunk total
+///   [12..512] up to 500 LZMA bytes, zero-padded
+///
+/// Unlike [`make_data_packet`]/[`wrap_data_frame`] (the T50 `0xAA 0xBB`
+/// data-packet format), the E-series reuses the command marker plus a command
+/// byte. The checksum spans `[idx][tot] + the 500 payload bytes`.
+pub fn make_eseries_bulk_frame(cmd: u8, payload: &[u8], idx: u8, total: u8) -> [u8; 512] {
+    let mut frame = [0u8; 512];
+    frame[0] = MAGIC1;
+    frame[1] = MAGIC2;
+    frame[2..4].copy_from_slice(&DATA_FRAME_PAYLOAD_LEN.to_le_bytes());
+    frame[4] = PROTO_ID;
+    frame[5] = DATA_TYPE;
+    frame[6] = 0xAA; // MARKER_AA
+    frame[7] = cmd;
+    frame[10] = idx;
+    frame[11] = total;
+
+    let copy_len = payload.len().min(DATA_PAYLOAD_SIZE);
+    frame[12..12 + copy_len].copy_from_slice(&payload[..copy_len]);
+
+    let chk: u16 = frame[10..].iter().map(|&b| b as u16).sum();
+    frame[8..10].copy_from_slice(&chk.to_le_bytes());
+    frame
+}
+
+/// Split an LZMA stream into E-series bulk frames for one page command
+/// (`0xD1` or `0xBB`). Each frame carries 500 LZMA bytes (last zero-padded).
+pub fn build_eseries_bulk_frames(cmd: u8, lzma: &[u8]) -> Vec<[u8; 512]> {
+    let num = lzma.len().div_ceil(DATA_PAYLOAD_SIZE).max(1);
+    let total = num as u8;
+    let mut frames = Vec::with_capacity(num);
+    for i in 0..num {
+        let off = i * DATA_PAYLOAD_SIZE;
+        let end = (off + DATA_PAYLOAD_SIZE).min(lzma.len());
+        frames.push(make_eseries_bulk_frame(cmd, &lzma[off..end], i as u8, total));
+    }
+    frames
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +175,30 @@ mod tests {
         assert_eq!(frames[0][6 + 5], 3); // pkt_total
         assert_eq!(frames[1][6 + 4], 1);
         assert_eq!(frames[2][6 + 4], 2);
+    }
+
+    #[test]
+    fn test_eseries_bulk_frame_layout() {
+        // Verify against the captured D1 chunk shape (docs/E_SERIES_PROTOCOL.md):
+        // 7E 5A FC 01 10 02 AA <cmd> [chk LE][idx][tot] <500 LZMA>.
+        let lzma = vec![0x5du8; 600]; // 2 chunks (500 + 100 padded)
+        let frames = build_eseries_bulk_frames(0xD1, &lzma);
+        assert_eq!(frames.len(), 2);
+        let f = &frames[0];
+        assert_eq!(&f[0..7], &[0x7e, 0x5a, 0xfc, 0x01, 0x10, 0x02, 0xaa]);
+        assert_eq!(f[7], 0xD1, "command byte");
+        assert_eq!(f[10], 0, "idx");
+        assert_eq!(f[11], 2, "total");
+        // checksum = LE u16 sum over [idx][tot] + 500 payload bytes (frame[10..])
+        let chk: u16 = f[10..].iter().map(|&b| b as u16).sum();
+        assert_eq!(u16::from_le_bytes([f[8], f[9]]), chk);
+        assert_eq!(f.len(), 512);
+        // last chunk: 100 real bytes, rest zero-padded to 500
+        let g = &frames[1];
+        assert_eq!(g[7], 0xD1);
+        assert_eq!(g[10], 1);
+        assert_eq!(g[11], 2);
+        assert!(g[12..112].iter().all(|&b| b == 0x5d));
+        assert!(g[112..512].iter().all(|&b| b == 0));
     }
 }

@@ -4,7 +4,7 @@
 //! 512-byte data frames, and BT-specific response parsing.
 
 use crate::cmd::{make_cmd, make_cmd_start_trans};
-use crate::data::build_data_frames;
+use crate::data::{build_data_frames, build_eseries_bulk_frames};
 use crate::error::Result;
 use crate::rfcomm::RfcommSocket;
 use crate::status::{self, MaterialInfo, PrinterStatus};
@@ -51,6 +51,26 @@ impl Transport for BtTransport {
             }
         }
         Ok(last_resp)
+    }
+
+    fn send_eseries_bulk(&self, cmd: u8, lzma: &[u8]) -> Result<Option<Vec<u8>>> {
+        // Each 512-byte E-series bulk frame is acked by the printer. We drain
+        // the ack after every frame (same rationale as send_bulk_data) and
+        // return the response after the last one so the caller can observe it.
+        let frames = build_eseries_bulk_frames(cmd, lzma);
+        let mut last_resp = None;
+        for (i, frame) in frames.iter().enumerate() {
+            let is_last = i == frames.len() - 1;
+            let resp = self.sock.send_data_frame(frame, true)?;
+            if is_last {
+                last_resp = resp;
+            }
+        }
+        Ok(last_resp)
+    }
+
+    fn send_raw_cmd_frame(&self, frame: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.sock.send_raw_frame(frame)
     }
 
     fn raw_fd(&self) -> RawFd {

@@ -68,6 +68,7 @@ fn run_pipeline(
         DEFAULT_MARGIN_DOTS,
         DEFAULT_MARGIN_DOTS,
         4,
+        1,
     );
 
     let (compressed, _avg) = compress_buffers(&buffers).unwrap();
@@ -205,6 +206,7 @@ fn test_full_pipeline_test_pattern() {
         DEFAULT_MARGIN_DOTS,
         DEFAULT_MARGIN_DOTS,
         4,
+        1,
     );
     assert_eq!(buffers.len(), 3);
 
@@ -261,6 +263,7 @@ fn test_pipeline_various_sizes() {
             DEFAULT_MARGIN_DOTS,
             DEFAULT_MARGIN_DOTS,
             4,
+            1,
         );
 
         // Verify expected buffer count

@@ -20,6 +20,17 @@ pub trait Transport: Send {
     /// If `read_final_response` is true, reads and returns the response after the last frame.
     fn send_bulk_data(&self, data: &[u8], read_final_response: bool) -> Result<Option<Vec<u8>>>;
 
+    /// Send an E-series page as `0xD1`/`0xBB` bulk frames (see
+    /// `docs/E_SERIES_PROTOCOL.md`). Each 512-byte frame is acked by the
+    /// printer; the response after the last frame is returned. Only Bluetooth
+    /// is supported (the E10pro is BT-only); USB returns an error.
+    fn send_eseries_bulk(&self, cmd: u8, lzma: &[u8]) -> Result<Option<Vec<u8>>>;
+
+    /// Send an arbitrary-length raw command frame (for E-series `0xD0`/`0xB0`
+    /// setup commands whose param block exceeds 4 bytes) and read the response.
+    /// Bluetooth only; USB returns an error.
+    fn send_raw_cmd_frame(&self, frame: &[u8]) -> Result<Option<Vec<u8>>>;
+
     /// Return the raw file descriptor of the underlying device.
     fn raw_fd(&self) -> RawFd;
 

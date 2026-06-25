@@ -8,11 +8,19 @@ use crate::error::{Error, Result};
 /// Patches the LZMA header to include the exact uncompressed size (Python's
 /// lzma module writes -1 by default; we write the real size).
 pub fn compress_lzma(data: &[u8]) -> Result<Vec<u8>> {
+    compress_lzma_dict(data, 8192)
+}
+
+/// As [`compress_lzma`] but with an explicit dictionary size.
+///
+/// The T50 path uses 8192. The E-series Katasymbol app uses 0x00200000 (2 MiB);
+/// see `docs/E_SERIES_PROTOCOL.md`. The properties byte (lc/lp/pb) is unchanged.
+pub fn compress_lzma_dict(data: &[u8], dict_size: u32) -> Result<Vec<u8>> {
     use liblzma::stream::{LzmaOptions, Stream};
 
     let mut opts =
         LzmaOptions::new_preset(6).map_err(|e| Error::Compression(format!("preset: {e}")))?;
-    opts.dict_size(8192)
+    opts.dict_size(dict_size)
         .literal_context_bits(3)
         .literal_position_bits(0)
         .position_bits(2)
@@ -98,6 +106,28 @@ pub fn compress_buffers(
     let avg = compressed.len() / buffers.len();
 
     Ok((compressed, avg))
+}
+
+/// E-series dictionary size, matching the Katasymbol app (`docs/E_SERIES_PROTOCOL.md`).
+pub const ESERIES_DICT_SIZE: u32 = 0x0020_0000;
+
+/// Compress one E-series page (its concatenated 4096-byte buffers) into a
+/// single LZMA1-alone stream with the 2 MiB dictionary the app uses.
+///
+/// A page is sent as one bulk command (`0xD1` for the first page, `0xBB` for
+/// subsequent pages); the firmware reads the 14-byte header at each 4096-byte
+/// boundary internally, so one LZMA stream covers the whole page.
+pub fn compress_page_e(
+    buffers: &[[u8; crate::buffer::PRINT_BUF_SIZE]],
+) -> Result<Vec<u8>> {
+    if buffers.is_empty() {
+        return Err(Error::InvalidParam("no buffers to compress".into()));
+    }
+    let mut concat = Vec::with_capacity(buffers.len() * crate::buffer::PRINT_BUF_SIZE);
+    for buf in buffers {
+        concat.extend_from_slice(buf);
+    }
+    compress_lzma_dict(&concat, ESERIES_DICT_SIZE)
 }
 
 #[cfg(test)]

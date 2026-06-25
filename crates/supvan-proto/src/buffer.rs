@@ -78,7 +78,25 @@ pub struct PrintBufferParams<'a> {
     pub prt_end: bool,
     pub margin_top: u16,
     pub margin_bottom: u16,
-    pub density: u8,
+    /// `nodu` field in PAGE_REG_BITS b1 (bits 2-5). On the T50 this carries the
+    /// density (0-15). On the E-series it is a fixed `4` and the real burn
+    /// energy lives in `energy` (byte 12) instead.
+    pub nodu: u8,
+    /// Burn-energy / red-deepness byte at offset 12.
+    ///
+    /// `Some(v)` writes `v` **unclamped** (the E-series path: real captured
+    /// values reach 23). `None` preserves the legacy T50 behaviour: byte 12 is
+    /// set to `nodu` clamped to `MAX_DENSITY`. The firmware zeroes this byte on
+    /// the final buffer of a page (see `split_into_buffers_e`).
+    pub energy: Option<u8>,
+    /// Cut mode (3 bits) in PAGE_REG_BITS b0 (bits 4-6). T50 uses 0; E-series
+    /// multi-buffer pages use 1 on the image buffers.
+    pub cut: u8,
+    /// Material type (0-3) encoded into PAGE_REG_BITS. Must match the loaded
+    /// label's reported `PaperType`/`label_type`; a mismatch can trip a
+    /// firmware "label mode error". T50-class die-cut labels use 1; E-series
+    /// continuous tape reports 0.
+    pub mat: u8,
 }
 
 /// Build a 4096-byte print buffer.
@@ -102,8 +120,9 @@ pub fn build_print_buffer(p: &PrintBufferParams) -> [u8; PRINT_BUF_SIZE] {
         page_st: p.page_st,
         page_end: p.page_end,
         prt_end: p.prt_end,
-        nodu: p.density,
-        mat: 1,
+        cut: p.cut,
+        nodu: p.nodu,
+        mat: p.mat,
         ..Default::default()
     });
     buf[2] = page_bits[0];
@@ -121,8 +140,12 @@ pub fn build_print_buffer(p: &PrintBufferParams) -> [u8; PRINT_BUF_SIZE] {
     buf[8..10].copy_from_slice(&mt.to_le_bytes());
     buf[10..12].copy_from_slice(&mb.to_le_bytes());
 
-    // Density
-    buf[12] = p.density.min(MAX_DENSITY);
+    // Burn energy (byte 12). E-series passes an explicit unclamped value; the
+    // legacy T50 path mirrors `nodu` clamped to MAX_DENSITY.
+    buf[12] = match p.energy {
+        Some(e) => e,
+        None => p.nodu.min(MAX_DENSITY),
+    };
 
     // Image data at offset 14
     let data_len = p.image_data.len().min(PRINT_BUF_SIZE - PRINT_BUF_HEADER);
@@ -143,7 +166,11 @@ pub fn build_print_buffer(p: &PrintBufferParams) -> [u8; PRINT_BUF_SIZE] {
     buf
 }
 
-/// Split column-major image data into multiple print buffers.
+/// Split column-major image data into multiple print buffers (T50 path).
+///
+/// `density` is written into both `nodu` (PAGE_REG) and the energy byte
+/// (clamped to `MAX_DENSITY`), matching the original T50 behaviour. For the
+/// E-series, use [`split_into_buffers_e`].
 ///
 /// Returns a Vec of 4096-byte print buffers ready for LZMA compression.
 pub fn split_into_buffers(
@@ -153,6 +180,7 @@ pub fn split_into_buffers(
     margin_top: u16,
     margin_bottom: u16,
     density: u8,
+    mat: u8,
 ) -> Vec<[u8; PRINT_BUF_SIZE]> {
     let max_cols = (MAX_BUF_DATA / per_line_byte as usize) as u16;
     let image_cols = total_cols - margin_top - margin_bottom;
@@ -178,7 +206,104 @@ pub fn split_into_buffers(
             prt_end: is_last,
             margin_top,
             margin_bottom,
-            density,
+            nodu: density,
+            energy: None,
+            cut: 0,
+            mat,
+        });
+        buffers.push(buf);
+        current_col += cols_in_buf;
+        cols_remaining -= cols_in_buf;
+    }
+
+    buffers
+}
+
+/// Knobs for the E-series (E10pro) print-buffer header, byte-verified from a
+/// real btsnoop capture (see `docs/E_SERIES_PROTOCOL.md`).
+#[derive(Debug, Clone, Copy)]
+pub struct ESeriesBufOpts {
+    /// PAGE_REG `nodu` (fixed 4 in the capture).
+    pub nodu: u8,
+    /// Burn energy (byte 12), unclamped. Captured value: 23. Written on every
+    /// buffer EXCEPT the page-end buffer, where the firmware sends 0.
+    pub energy: u8,
+    /// Cut mode on the image buffers (1 on the captured multi-buffer page).
+    pub cut: u8,
+    /// Material type (0 = continuous tape).
+    pub mat: u8,
+    /// Header `margin_top` (feed dots before the image). Captured: 1.
+    pub margin_top: u16,
+    /// Header `margin_bottom` (feed dots after the image). Captured: 1. Raising
+    /// this is the way to feed the tape clear of the trailing cut (trailing
+    /// blank raster columns get trimmed by the firmware).
+    pub margin_bottom: u16,
+}
+
+impl Default for ESeriesBufOpts {
+    fn default() -> Self {
+        // Defaults straight from the captured E10pro buffers.
+        Self {
+            nodu: 4,
+            energy: 23,
+            cut: 1,
+            mat: 0,
+            margin_top: 1,
+            margin_bottom: 1,
+        }
+    }
+}
+
+/// Split column-major image data into E-series print buffers (one page).
+///
+/// Split column-major image data into E-series print buffers (one page).
+///
+/// `total_cols` is the number of raster columns in `image_data` (all are
+/// shipped as image data — unlike the T50 [`split_into_buffers`], margins are
+/// NOT carved out of the raster here). The header `margin_top`/`margin_bottom`
+/// (feed-before/after-image dots) come from [`ESeriesBufOpts`].
+///
+/// Differs from [`split_into_buffers`] in these byte-verified ways:
+///   * `nodu` (PAGE_REG) and `energy` (byte 12) are independent; `energy` is
+///     written unclamped.
+///   * `energy` is set to **0** on the page-end buffer (the firmware does this).
+///   * `cut`/`mat`/`margin_*` come from [`ESeriesBufOpts`].
+pub fn split_into_buffers_e(
+    image_data: &[u8],
+    per_line_byte: u8,
+    total_cols: u16,
+    opts: ESeriesBufOpts,
+) -> Vec<[u8; PRINT_BUF_SIZE]> {
+    let max_cols = (MAX_BUF_DATA / per_line_byte as usize) as u16;
+    let mut buffers = Vec::new();
+    let mut cols_remaining = total_cols;
+    let mut current_col: u16 = 0;
+
+    while cols_remaining > 0 {
+        let cols_in_buf = cols_remaining.min(max_cols);
+        let is_first = current_col == 0;
+        let is_last = cols_remaining <= max_cols;
+
+        let img_start = current_col as usize * per_line_byte as usize;
+        let img_end = img_start + cols_in_buf as usize * per_line_byte as usize;
+        let img_chunk = &image_data[img_start..img_end.min(image_data.len())];
+
+        // The firmware zeroes the energy byte on the final buffer of a page.
+        let energy = if is_last { 0 } else { opts.energy };
+
+        let buf = build_print_buffer(&PrintBufferParams {
+            image_data: img_chunk,
+            per_line_byte,
+            cols_in_buf,
+            page_st: is_first,
+            page_end: is_last,
+            prt_end: is_last,
+            margin_top: opts.margin_top,
+            margin_bottom: opts.margin_bottom,
+            nodu: opts.nodu,
+            energy: Some(energy),
+            cut: opts.cut,
+            mat: opts.mat,
         });
         buffers.push(buf);
         current_col += cols_in_buf;
@@ -232,7 +357,10 @@ mod tests {
             prt_end: true,
             margin_top: 8,
             margin_bottom: 8,
-            density: 4,
+            nodu: 4,
+            energy: None,
+            cut: 0,
+            mat: 1,
         });
         // Verify buffer structure
         assert_eq!(buf[6], 48); // bytes per line
@@ -253,7 +381,58 @@ mod tests {
         let per_line_byte = 48u8;
         let total_cols = 240u16;
         let image_data = vec![0u8; total_cols as usize * per_line_byte as usize];
-        let bufs = split_into_buffers(&image_data, per_line_byte, total_cols, 8, 8, 4);
+        let bufs = split_into_buffers(&image_data, per_line_byte, total_cols, 8, 8, 4, 1);
         assert_eq!(bufs.len(), 3);
+    }
+
+    #[test]
+    fn test_eseries_buffer_header_matches_capture() {
+        // Reproduce the byte-verified E10pro D1 page header (docs/E_SERIES_PROTOCOL.md):
+        // nodu=4, energy=23, cut=1, mat=0, margins 1/1; energy zeroed on page-end.
+        let per_line_byte = 12u8;
+        // 377 raster cols -> max_cols = 4074/12 = 339, so 339 + 38 = 2 buffers.
+        let total_cols = 377u16;
+        let image_data = vec![0u8; total_cols as usize * per_line_byte as usize];
+        let bufs = split_into_buffers_e(
+            &image_data,
+            per_line_byte,
+            total_cols,
+            ESeriesBufOpts::default(),
+        );
+        assert_eq!(bufs.len(), 2);
+
+        // buf1 (first, not last): PageSt + cut=1 -> b0=0x12, b1=0x10
+        assert_eq!(bufs[0][2], 0x12, "buf1 PAGE_REG b0");
+        assert_eq!(bufs[0][3], 0x10, "buf1 PAGE_REG b1 (nodu=4, mat=0)");
+        assert_eq!(bufs[0][6], 12, "buf1 bytes/line");
+        assert_eq!(bufs[0][8], 1, "buf1 margin_top");
+        assert_eq!(bufs[0][10], 1, "buf1 margin_bottom");
+        assert_eq!(bufs[0][12], 23, "buf1 energy (unclamped)");
+
+        // buf2 (last/page-end): PageEnd + PrtEnd + cut=1 -> b0=0x1c, energy zeroed
+        assert_eq!(bufs[1][2], 0x1c, "buf2 PAGE_REG b0");
+        assert_eq!(bufs[1][3], 0x10, "buf2 PAGE_REG b1");
+        assert_eq!(bufs[1][12], 0, "buf2 energy zeroed on page-end");
+    }
+
+    #[test]
+    fn test_eseries_single_buffer_page() {
+        // Single-buffer page (like the captured BB page): PageSt+PageEnd+PrtEnd, cut=0.
+        let per_line_byte = 12u8;
+        let total_cols = 137u16;
+        let image_data = vec![0u8; total_cols as usize * per_line_byte as usize];
+        let bufs = split_into_buffers_e(
+            &image_data,
+            per_line_byte,
+            total_cols,
+            ESeriesBufOpts {
+                cut: 0,
+                ..ESeriesBufOpts::default()
+            },
+        );
+        assert_eq!(bufs.len(), 1);
+        // PageSt|PageEnd|PrtEnd = 0x02|0x04|0x08 = 0x0e, cut=0
+        assert_eq!(bufs[0][2], 0x0e, "single-buffer PAGE_REG b0");
+        assert_eq!(bufs[0][4], 137, "single-buffer cols low");
     }
 }

@@ -3,7 +3,7 @@
 //! Uses 0xC0/0x40 command framing with big-endian parameters,
 //! 64-byte HID reports for data transfer, and 8-byte responses.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::hidraw::{HID_REPORT_SIZE, HidrawDevice};
 use crate::status::{MaterialInfo, PrinterStatus};
 use crate::transport::Transport;
@@ -160,6 +160,20 @@ impl Transport for UsbHidTransport {
             }
         }
         Ok(None)
+    }
+
+    fn send_eseries_bulk(&self, _cmd: u8, _lzma: &[u8]) -> Result<Option<Vec<u8>>> {
+        // The E-series (E10pro) is Bluetooth-only; there is no USB E-series
+        // printer to capture/verify against, so this path is unsupported.
+        Err(Error::InvalidParam(
+            "E-series bulk transfer is not supported over USB".into(),
+        ))
+    }
+
+    fn send_raw_cmd_frame(&self, _frame: &[u8]) -> Result<Option<Vec<u8>>> {
+        Err(Error::InvalidParam(
+            "E-series raw command frames are not supported over USB".into(),
+        ))
     }
 
     fn raw_fd(&self) -> RawFd {

@@ -14,6 +14,12 @@ pub const CMD_START_PRINT: u8 = 0x13;
 pub const CMD_STOP_PRINT: u8 = 0x14;
 pub const CMD_RD_DEV_NAME: u8 = 0x16;
 pub const CMD_READ_REV: u8 = 0x17;
+/// RD_LAB_DPI (34 / 0x22) — query the loaded material's resolution.
+/// The vendor app sends this with param 0 and decodes a dots/mm × 100 value
+/// from the response (offset depends on PaperType). Not part of the T50 print
+/// flow the rest of this crate implements; used by the `dpi` diagnostic to
+/// determine non-T50 (e.g. E-series tape) printer geometry.
+pub const CMD_RD_LAB_DPI: u8 = 0x22;
 pub const CMD_RETURN_MAT: u8 = 0x30;
 pub const CMD_NEXT_ZIPPEDBULK: u8 = 0x5C;
 pub const CMD_READ_FWVER: u8 = 0xC5;
@@ -57,6 +63,35 @@ pub fn make_cmd_start_trans(cmd: u8, block_size: u16, block_count: u16) -> [u8; 
     pkt[14..16].copy_from_slice(&block_count.to_le_bytes());
 
     let chk: u16 = pkt[10..16].iter().map(|&b| b as u16).sum();
+    pkt[8..10].copy_from_slice(&chk.to_le_bytes());
+    pkt
+}
+
+/// Build a variable-length command frame for commands whose param block is
+/// longer than the standard 4 bytes (e.g. the E-series `0xD0` setup, `0xB0`
+/// date). `params` is the body that follows the fixed `00 01` prefix.
+///
+/// Layout: `7E 5A [plen LE] 10 01 AA <cmd> [chk LE] 00 01 <params...>` where
+/// `plen = 4 (header after marker incl. cmd+chk) ... ` is computed as
+/// `2 (chk) + 2 (00 01) + params.len()`'s container — concretely the declared
+/// length matches the captured frames (`0x15` for D0's 9 extra param bytes).
+/// The checksum is the LE u16 sum over `00 01 <params>`.
+pub fn make_cmd_ext(cmd: u8, params: &[u8]) -> Vec<u8> {
+    // Body after the checksum field is `00 01` then params.
+    let body_len = 2 + params.len();
+    // Declared payload length (byte 2): captured frames use 0x0C for the 4-byte
+    // body and grow by the extra param bytes. 0x0C corresponds to body_len=6
+    // (00 01 + 4 param bytes), i.e. plen = body_len + 6.
+    let plen = (body_len + 6) as u16;
+    let mut pkt = Vec::with_capacity(10 + body_len);
+    pkt.extend_from_slice(&[MAGIC1, MAGIC2]);
+    pkt.extend_from_slice(&plen.to_le_bytes());
+    pkt.extend_from_slice(&[PROTO_ID, PROTO_VER, MARKER_AA, cmd]);
+    pkt.extend_from_slice(&[0, 0]); // checksum placeholder
+    pkt.push(0x00);
+    pkt.push(0x01);
+    pkt.extend_from_slice(params);
+    let chk: u16 = pkt[10..].iter().map(|&b| b as u16).sum();
     pkt[8..10].copy_from_slice(&chk.to_le_bytes());
     pkt
 }
@@ -105,5 +140,36 @@ mod tests {
         let chk: u16 = pkt[10..16].iter().map(|&b| b as u16).sum();
         assert_eq!(pkt[8], (chk & 0xFF) as u8);
         assert_eq!(pkt[9], (chk >> 8) as u8);
+    }
+
+    #[test]
+    fn test_make_cmd_ext_matches_captured_d0() {
+        // Captured E10pro D0 setup frame (docs/E_SERIES_PROTOCOL.md):
+        // 7e5a15001001aad0 0101 0001 02 0000 02 0000 f801 03 0000 0000
+        let params = [
+            0x02, 0x00, 0x00, 0x02, 0x00, 0x00, 0xf8, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let frame = make_cmd_ext(0xD0, &params);
+        let expected =
+            hex_to_vec("7e5a15001001aad00101000102000002 0000f8010300000000");
+        assert_eq!(frame, expected);
+    }
+
+    #[test]
+    fn test_make_cmd_ext_matches_captured_b0() {
+        // Captured B0 frame carrying the ASCII date "20260625".
+        let mut params = b"20260625".to_vec();
+        params.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // trailing zeros from capture
+        let frame = make_cmd_ext(0xB0, &params);
+        let expected = hex_to_vec("7e5a16001001aab0980100013230323630363235000000000000");
+        assert_eq!(frame, expected);
+    }
+
+    fn hex_to_vec(s: &str) -> Vec<u8> {
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 }
