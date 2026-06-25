@@ -208,6 +208,20 @@ pub fn families() -> &'static [DriverFamily] {
     &registry().families
 }
 
+/// Load the registry once, idempotently. Unlike [`load`] (which panics if
+/// called twice), this is safe to call from multiple entry points — e.g. tests
+/// that share a process. A no-op if the registry is already populated.
+#[cfg(test)]
+pub fn ensure_loaded() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if REGISTRY.get().is_none() {
+            load();
+        }
+    });
+}
+
 /// The default driver family (supvan_t50).
 pub fn default_family() -> &'static DriverFamily {
     &registry().families[registry().default_family_idx]
@@ -259,4 +273,69 @@ pub fn parse_mdl(device_id: &str) -> Option<&str> {
     device_id
         .split(';')
         .find_map(|field| field.strip_prefix("MDL:"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Once;
+
+    // Tests share one process and `load()` panics if called twice; gate it.
+    static INIT: Once = Once::new();
+    fn init() {
+        INIT.call_once(|| {
+            if REGISTRY.get().is_none() {
+                load();
+            }
+        });
+    }
+
+    #[test]
+    fn test_eseries_resolves_to_e10pro_family() {
+        init();
+        // The E10pro advertises BT name "T0132F2501032470"; the app/model hints
+        // use "E10pro"/"E10". Both must map to the dedicated e10pro family, not
+        // the T50 family (different geometry + print path).
+        for name in ["T0132F2501032470", "E10pro", "e10", "E12", "E16"] {
+            let fam = family_for_model_hint(name);
+            let driver = fam.driver_name.to_string_lossy();
+            assert_eq!(
+                driver, "supvan_e10pro",
+                "{name} should resolve to supvan_e10pro, got {driver}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_e10pro_geometry() {
+        init();
+        let fam = family_for_model_hint("E10pro");
+        // 8 dots/mm (203 DPI), 96-dot (12 mm) printable head
+        // (docs/E_SERIES_PROTOCOL.md, confirmed by ruler calibration).
+        assert_eq!(fam.dpi, 203, "e10pro DPI");
+        assert_eq!(fam.printhead_width_dots, 96, "e10pro printhead dots");
+    }
+
+    #[test]
+    fn test_e10pro_bt_name_discovered() {
+        init();
+        // Previously the E10pro's "T0132..." name was not matched by any
+        // pattern, so discovery missed it. The t0132 pattern fixes that.
+        assert!(is_matching_bt_name("T0132F2501032470"));
+        assert!(is_matching_bt_name("E10pro"));
+    }
+
+    #[test]
+    fn test_t50_still_resolves_to_t50() {
+        init();
+        // Moving e10/e11/... off the T50 patterns must not break real T50 names.
+        assert_eq!(
+            family_for_model_hint("T50M Pro").driver_name.to_string_lossy(),
+            "supvan_t50"
+        );
+        assert_eq!(
+            family_for_model_hint("T0117").driver_name.to_string_lossy(),
+            "supvan_t50"
+        );
+    }
 }

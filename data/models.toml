@@ -46,6 +46,21 @@ media_mm = [
     [25, 30], [25, 40], [25, 25],
 ]
 
+# E10pro and the E-series handheld tape printers. Bluetooth-only, 15 mm
+# continuous tape. Reverse-engineered from a real btsnoop capture
+# (docs/E_SERIES_PROTOCOL.md): 8 dots/mm (203 DPI), 96-dot (12 mm) printable
+# head. NOTE: the E-series uses a DISTINCT print path (0xD1/0xBB two-stage
+# transfer, per-buffer energy byte, 2 MiB-dict LZMA) — it is NOT compatible with
+# the T50 buffer/transfer code despite sharing the connectivity/status layer.
+[[families]]
+name = "supvan_e10pro"
+description = "Supvan E10pro / E-series"
+dpi = 203
+printhead_dots = 96
+media_mm = [
+    [12, 20], [12, 30], [12, 40], [12, 50],
+]
+
 [[families]]
 name = "supvan_tp76"
 description = "Supvan TP76 Series"
@@ -203,7 +218,8 @@ family = "supvan_sp650"
 # always accepted for discovery but don't select a specific family.
 
 [bt_patterns]
-supvan_t50 = ["t50", "t0117", "e10", "e11", "e12", "e16"]
+supvan_t50 = ["t50", "t0117"]
+supvan_e10pro = ["e10", "e11", "e12", "e16", "t0132"]
 supvan_t80 = ["t80"]
 supvan_g = ["g11", "g15", "g18"]
 supvan_tp76 = ["tp76"]
