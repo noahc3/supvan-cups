@@ -11,8 +11,8 @@
 //! This crate has no IPP/CUPS knowledge — `supvan-app` layers that on via the
 //! `ipp-printer-app` framework. See `docs/PROTOCOL.md` for the wire format.
 
+pub mod ble;
 pub mod bitmap;
-pub mod bt_transport;
 pub mod buffer;
 pub mod cmd;
 pub mod compress;
@@ -22,6 +22,7 @@ pub mod hidraw;
 pub mod printer;
 pub mod rfcomm;
 pub mod speed;
+pub mod spp_pipe;
 pub mod status;
 pub mod transport;
 pub mod usb_transport;

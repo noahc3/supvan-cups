@@ -94,6 +94,11 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         trail_feed: u32,
     },
+    /// Feed/advance one blank label (PAPER_SKIP)
+    Feed {
+        /// Bluetooth address or /dev/hidrawN path
+        target: String,
+    },
     /// Scan for Supvan Bluetooth devices (via BlueZ D-Bus)
     Discover,
 }
@@ -109,16 +114,16 @@ fn connect(target: &str) -> Result<Printer, Box<dyn Error>> {
     Ok(printer)
 }
 
-fn cmd_probe(target: &str) -> CliResult {
+async fn cmd_probe(target: &str) -> CliResult {
     let printer = connect(target)?;
 
-    if printer.check_device()? {
+    if printer.check_device().await? {
         eprintln!("Device: OK");
     } else {
         return Err("device check: no response".into());
     }
 
-    if let Some(status) = printer.query_status()? {
+    if let Some(status) = printer.query_status().await? {
         eprintln!("Status:");
         eprintln!("  printing:     {}", status.printing);
         eprintln!("  device_busy:  {}", status.device_busy);
@@ -131,17 +136,17 @@ fn cmd_probe(target: &str) -> CliResult {
         }
     }
 
-    if let Some(name) = printer.read_device_name()? {
+    if let Some(name) = printer.read_device_name().await? {
         eprintln!("Device name: {name}");
     }
-    if let Some(fw) = printer.read_firmware_version()? {
+    if let Some(fw) = printer.read_firmware_version().await? {
         eprintln!("Firmware:    {fw}");
     }
-    if let Some(ver) = printer.read_version()? {
+    if let Some(ver) = printer.read_version().await? {
         eprintln!("Protocol:    {ver}");
     }
 
-    if let Some(mat) = printer.query_material()? {
+    if let Some(mat) = printer.query_material().await? {
         eprintln!("Material:");
         eprintln!("  Label:     {}mm x {}mm", mat.width_mm, mat.height_mm);
         eprintln!("  Type:      {}", mat.label_type);
@@ -159,15 +164,16 @@ fn cmd_probe(target: &str) -> CliResult {
     Ok(())
 }
 
-fn cmd_material(target: &str) -> CliResult {
+async fn cmd_material(target: &str) -> CliResult {
     let printer = connect(target)?;
 
-    if !printer.check_device()? {
+    if !printer.check_device().await? {
         return Err("device not responding".into());
     }
 
     let mat = printer
-        .query_material()?
+        .query_material()
+        .await?
         .ok_or("no material info (label not installed?)")?;
 
     println!(
@@ -188,12 +194,12 @@ fn cmd_material(target: &str) -> CliResult {
     Ok(())
 }
 
-fn cmd_test_print(target: &str, density: u8) -> CliResult {
+async fn cmd_test_print(target: &str, density: u8) -> CliResult {
     let printer = connect(target)?;
 
     // Query material to get label dimensions, falling back to printhead-width
     // defaults if no label is installed.
-    let mat = match printer.query_material()? {
+    let mat = match printer.query_material().await? {
         Some(m) => m,
         None => {
             eprintln!(
@@ -212,28 +218,20 @@ fn cmd_test_print(target: &str, density: u8) -> CliResult {
         "Printing test pattern on {}mm x {}mm label...",
         mat.width_mm, mat.height_mm
     );
-    printer.test_print(&mat, density)?;
+    printer.test_print(&mat, density).await?;
     eprintln!("Done.");
     Ok(())
 }
 
-/// Query the DPI/resolution command(s) and interpret the raw response.
-///
-/// The vendor app exposes more than one resolution-query command depending on
-/// the printer subclass: `RD_LAB_DPI` (0x22) on some, `RD_LAB_DPI24` (0x24) /
-/// `RD_LAB_DPI25` (0x25) on others. We don't know which the E10pro answers, so
-/// we send each in turn and dump whatever comes back — unfiltered — then scan
-/// every little-endian u16 for a value in the plausible 11.0–12.8 dots/mm range
-/// (1100–1280 when scaled ×100), flagging candidates.
-fn cmd_dpi(target: &str) -> CliResult {
+async fn cmd_dpi(target: &str) -> CliResult {
     let printer = connect(target)?;
 
-    if !printer.check_device()? {
+    if !printer.check_device().await? {
         return Err("device not responding".into());
     }
 
     // PaperType drives the app's field-offset choice; surface it for context.
-    match printer.query_material()?.map(|m| m.label_type) {
+    match printer.query_material().await?.map(|m| m.label_type) {
         Some(t) => eprintln!("PaperType (label_type): {t}"),
         None => eprintln!("PaperType: (no material reported)"),
     }
@@ -245,7 +243,7 @@ fn cmd_dpi(target: &str) -> CliResult {
     let mut any_response = false;
     for (cmd, name) in DPI_CMDS {
         println!("\n=== {name} (0x{cmd:02X}) ===");
-        match printer.send_raw_cmd(cmd, 0)? {
+        match printer.send_raw_cmd(cmd, 0).await? {
             None => println!("  (no response — printer does not recognize this command)"),
             Some(resp) => {
                 any_response = true;
@@ -301,7 +299,7 @@ fn hex_dump(bytes: &[u8]) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cmd_calibrate(
+async fn cmd_calibrate(
     target: &str,
     width_dots: u32,
     length_dots: u32,
@@ -336,15 +334,17 @@ fn cmd_calibrate(
             mat,
             ..Default::default()
         };
-        printer.calibrate_print_e(
-            width_dots,
-            length_dots,
-            energy,
-            solid,
-            lead_feed,
-            trail_feed,
-            opts,
-        )?;
+        printer
+            .calibrate_print_e(
+                width_dots,
+                length_dots,
+                energy,
+                solid,
+                lead_feed,
+                trail_feed,
+                opts,
+            )
+            .await?;
         eprintln!("Done.");
         return Ok(());
     }
@@ -356,8 +356,17 @@ fn cmd_calibrate(
         eprintln!("  dots/mm (across) = {width_dots} / measured_width_mm");
         eprintln!("  dots/mm (feed)   = {length_dots} / measured_length_mm");
     }
-    printer.calibrate_print_opts(width_dots, length_dots, density, mat, solid, start_param)?;
+    printer
+        .calibrate_print_opts(width_dots, length_dots, density, mat, solid, start_param)
+        .await?;
     eprintln!("Done.");
+    Ok(())
+}
+
+async fn cmd_feed(target: &str) -> CliResult {
+    let printer = connect(target)?;
+    printer.paper_skip().await?;
+    eprintln!("Fed one label.");
     Ok(())
 }
 
@@ -369,15 +378,16 @@ fn cmd_discover() {
     eprintln!("  bluetoothctl devices | grep -i 'T0117\\|T50\\|Supvan\\|Katasymbol'");
 }
 
-fn main() -> ExitCode {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Probe { target } => cmd_probe(&target),
-        Command::Material { target } => cmd_material(&target),
-        Command::TestPrint { target, density } => cmd_test_print(&target, density),
-        Command::Dpi { target } => cmd_dpi(&target),
+        Command::Probe { target } => cmd_probe(&target).await,
+        Command::Material { target } => cmd_material(&target).await,
+        Command::TestPrint { target, density } => cmd_test_print(&target, density).await,
+        Command::Dpi { target } => cmd_dpi(&target).await,
         Command::Calibrate {
             target,
             width_dots,
@@ -392,21 +402,25 @@ fn main() -> ExitCode {
             cut,
             lead_feed,
             trail_feed,
-        } => cmd_calibrate(
-            &target,
-            width_dots,
-            length_dots,
-            density,
-            mat,
-            solid,
-            start_param,
-            e_series,
-            energy,
-            nodu,
-            cut,
-            lead_feed,
-            trail_feed,
-        ),
+        } => {
+            cmd_calibrate(
+                &target,
+                width_dots,
+                length_dots,
+                density,
+                mat,
+                solid,
+                start_param,
+                e_series,
+                energy,
+                nodu,
+                cut,
+                lead_feed,
+                trail_feed,
+            )
+            .await
+        }
+        Command::Feed { target } => cmd_feed(&target).await,
         Command::Discover => {
             cmd_discover();
             Ok(())
@@ -458,6 +472,15 @@ mod tests {
                 assert_eq!(density, 7);
             }
             _ => panic!("expected TestPrint"),
+        }
+    }
+
+    #[test]
+    fn parse_feed_with_target() {
+        let cli = Cli::try_parse_from(["supvan-cli", "feed", "/dev/hidraw3"]).unwrap();
+        match cli.command {
+            Command::Feed { target } => assert_eq!(target, "/dev/hidraw3"),
+            _ => panic!("expected Feed"),
         }
     }
 

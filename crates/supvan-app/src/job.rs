@@ -185,7 +185,7 @@ impl KsJob {
         true
     }
 
-    pub fn transfer_page(&mut self, dev: &KsDevice) -> Result<(), JobFailure> {
+    pub async fn transfer_page(&mut self, dev: &KsDevice) -> Result<(), JobFailure> {
         let is_mock = dev.is_mock();
         let started = Instant::now();
         log::info!(
@@ -247,7 +247,7 @@ impl KsJob {
                 };
                 let buffers =
                     split_into_buffers_e(&canvas, canvas_bpl as u8, num_cols as u16, opts);
-                printer.print_eseries(&[buffers], num_cols as u16)
+                printer.print_eseries(&[buffers], num_cols as u16).await
             } else {
                 let buffers = split_into_buffers(
                     &canvas,
@@ -266,13 +266,13 @@ impl KsJob {
                     }
                 };
                 let speed = calc_speed(avg);
-                printer.print_compressed(&compressed, speed)
+                printer.print_compressed(&compressed, speed).await
             };
             dev.printing.store(false, Ordering::Release);
             match result {
                 Ok(()) => Ok(()),
                 Err(ProtoError::InvalidResponse(msg)) => {
-                    if let Ok(Some(s)) = printer.query_status() {
+                    if let Ok(Some(s)) = printer.query_status().await {
                         if s.has_error() {
                             Err(failure_from_status(&s, "print"))
                         } else {
@@ -288,7 +288,7 @@ impl KsJob {
             // Mock device: simulate the print delay, then check the simulator
             // for a queued failure. Dumps already happened above so the operator
             // can still inspect the output even on a simulated abort.
-            std::thread::sleep(mock::controller().delay());
+            tokio::time::sleep(mock::controller().delay()).await;
             match mock::controller().take_print_failure() {
                 Some(f) => Err(f),
                 None => {
@@ -324,12 +324,12 @@ impl KsJob {
         self.lines_received = 0;
     }
 
-    pub fn end(self, dev: &KsDevice) {
+    pub async fn end(self, dev: &KsDevice) {
         if let Some(ref printer) = dev.printer {
             let mut settled = false;
             for i in 0..COMPLETION_POLLS {
-                std::thread::sleep(COMPLETION_POLL_INTERVAL);
-                match printer.query_status() {
+                tokio::time::sleep(COMPLETION_POLL_INTERVAL).await;
+                match printer.query_status().await {
                     Ok(Some(s)) if !s.printing && !s.device_busy => {
                         log::info!("KsJob::end: complete after {i} polls");
                         settled = true;
@@ -351,6 +351,7 @@ impl KsJob {
     }
 }
 
+#[async_trait::async_trait]
 impl RasterDriver for KsJob {
     type Device = KsDevice;
 
@@ -414,7 +415,7 @@ impl RasterDriver for KsJob {
         Ok(())
     }
 
-    fn end_page(
+    async fn end_page(
         &mut self,
         options: &JobOptions,
         _page: u32,
@@ -425,14 +426,14 @@ impl RasterDriver for KsJob {
             if copies > 1 {
                 log::info!("end_page: copy {}/{copies}", copy + 1);
             }
-            self.transfer_page(dev)?;
+            self.transfer_page(dev).await?;
         }
         self.clear_page();
         Ok(())
     }
 
-    fn end_job(self, dev: &Self::Device) {
-        self.end(dev);
+    async fn end_job(self, dev: &Self::Device) {
+        self.end(dev).await;
     }
 }
 

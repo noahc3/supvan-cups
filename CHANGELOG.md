@@ -5,6 +5,38 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: breaking changes bump the
 minor version).
 
+## [Unreleased]
+
+## [0.3.0] - 2026-06-26
+
+Async transport stack + a feature-gated BLE GATT transport for BLE-only
+printers (E11/E12-class). Verified end-to-end on a T50M Pro over USB and
+Bluetooth-classic; the BLE path is implemented to the vendor spec but
+unverified against hardware.
+
+### Added
+
+- `supvan-cli feed <target>` — advances one blank label via the `PAPER_SKIP`
+  (0x2E) command (`Printer::paper_skip`).
+- **BLE GATT transport** for BLE-only printers (E11/E12-class), behind the
+  off-by-default `ble` feature (pulls `bluer`). BLE reuses the shared SPP codec —
+  same 16-byte framing over GATT notify/write characteristics, with the vendor's
+  service/characteristic auto-detect and byte-7 response correlation. Discovery
+  scans for `^[TGD]\d{2}` advertisers in OUI `A4:93:40` and folds them into the
+  unified `supvan://` device (USB → BT → BLE fallback). **Unverified against
+  hardware** — we own no BLE printer; an E11/E12 reporter must validate it.
+
+### Changed (breaking)
+
+- **Transport stack is now async.** `Transport`, the new `SppPipe`/`SppCodec`
+  split, and `Printer` are async (`async-trait`); blocking RFCOMM/HID FFI runs
+  via `tokio::task::block_in_place`. This lets a natively-async BLE transport
+  share one codec. Requires `ipp-printer-app` 0.8.0 (its `DeviceBackend`/
+  `RasterDriver`/`PrintJobFn` callbacks went async; `list` now returns
+  `Vec<DiscoveredDevice>`).
+- Dropped the dead `Transport::raw_fd`; folded the `NEXT_ZIPPEDBULK` header
+  encoding into `Transport::send_bulk_header` (was a `use_socket_io` branch).
+
 ## [0.2.0] - 2026-06-24
 
 A cleanup, correctness, and modernization pass across all three crates

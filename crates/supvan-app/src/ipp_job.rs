@@ -14,8 +14,9 @@ use crate::models;
 /// Printhead resolution in dots per millimetre (matches supvan-proto).
 const DOTS_PER_MM: i32 = 8;
 
-/// Run a full CUPS raster document through [`KsJob`].
-pub fn run_cups_raster_job(
+/// Run a full CUPS raster document through [`KsJob`]. Runs on the caller's
+/// tokio runtime (the framework's print worker) — no nested runtime.
+pub async fn run_cups_raster_job(
     printer_name: &str,
     device_uri: &str,
     darkness: i32,
@@ -24,35 +25,7 @@ pub fn run_cups_raster_job(
     raster: &[u8],
     copies_override: u32,
 ) -> Result<(), JobFailure> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| JobFailure::other(format!("tokio runtime: {e}")))?;
-
-    rt.block_on(async {
-        run_cups_raster_job_async(
-            printer_name,
-            device_uri,
-            darkness,
-            printhead_width_dots,
-            driver_name,
-            raster,
-            copies_override,
-        )
-        .await
-    })
-}
-
-async fn run_cups_raster_job_async(
-    printer_name: &str,
-    device_uri: &str,
-    darkness: i32,
-    printhead_width_dots: u32,
-    driver_name: &str,
-    raster: &[u8],
-    copies_override: u32,
-) -> Result<(), JobFailure> {
-    let dev = crate::device::open_uri(device_uri).ok_or_else(|| {
+    let dev = crate::device::open_uri(device_uri).await.ok_or_else(|| {
         JobFailure::new(
             ipp_printer_app::PrinterReason::OFFLINE,
             format!("cannot open device {device_uri}"),
@@ -117,7 +90,7 @@ async fn run_cups_raster_job_async(
             RasterDriver::write_line(state, &options, y as u32, &line)?;
         }
 
-        RasterDriver::end_page(state, &options, page_num, &dev)?;
+        RasterDriver::end_page(state, &options, page_num, &dev).await?;
         page_num += 1;
 
         page_next = page
@@ -127,7 +100,7 @@ async fn run_cups_raster_job_async(
     }
 
     if let Some(j) = job.take() {
-        RasterDriver::end_job(j, &dev);
+        RasterDriver::end_job(j, &dev).await;
     }
 
     Ok(())
@@ -163,10 +136,10 @@ fn job_record(
 /// contain-fits it onto the loaded label (aspect preserved, centered, white
 /// padding), then drives [`KsJob`]'s existing 8bpp path (dither → device).
 ///
-/// Plain synchronous — JPEG decode is sync and the device transfer is the same
-/// blocking path the raster job uses, so no tokio runtime is needed.
+/// JPEG decode + fit is synchronous; the device transfer is awaited like the
+/// raster path. Runs on the caller's tokio runtime (the print worker).
 #[allow(clippy::too_many_arguments)]
-pub fn run_jpeg_job(
+pub async fn run_jpeg_job(
     printer_name: &str,
     device_uri: &str,
     darkness: i32,
@@ -187,7 +160,7 @@ pub fn run_jpeg_job(
         )));
     }
 
-    let dev = crate::device::open_uri(device_uri).ok_or_else(|| {
+    let dev = crate::device::open_uri(device_uri).await.ok_or_else(|| {
         JobFailure::new(
             ipp_printer_app::PrinterReason::OFFLINE,
             format!("cannot open device {device_uri}"),
@@ -220,8 +193,8 @@ pub fn run_jpeg_job(
         RasterDriver::write_line(&mut job, &options, y as u32, &canvas[y * w..(y + 1) * w])?;
     }
     // end_page transfers `options.copies` times internally — do not loop here.
-    RasterDriver::end_page(&mut job, &options, 0, &dev)?;
-    RasterDriver::end_job(job, &dev);
+    RasterDriver::end_page(&mut job, &options, 0, &dev).await?;
+    RasterDriver::end_job(job, &dev).await;
     Ok(())
 }
 
@@ -360,9 +333,9 @@ mod tests {
     /// dispatch, transfer_page's `eseries_pack` + `split_into_buffers_e`, and
     /// `print_eseries`. A successful run prints a non-blank label and returns
     /// Ok; verify the print is non-blank and NOT doubled by eye.
-    #[test]
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires a live E10pro over Bluetooth; set SUPVAN_LIVE_BT=<mac>"]
-    fn live_eseries_jpeg() {
+    async fn live_eseries_jpeg() {
         let mac = std::env::var("SUPVAN_LIVE_BT")
             .expect("set SUPVAN_LIVE_BT=<printer mac> to run this test");
         let _ = env_logger::try_init();
@@ -370,7 +343,7 @@ mod tests {
 
         // Register a supvan:// slug -> BT address so open_uri can resolve it.
         let slug = "livetest";
-        crate::device::register_supvan(slug, None, Some(mac.clone()));
+        crate::device::register_supvan(slug, None, Some(mac.clone()), None);
         let uri = format!("supvan://{slug}");
 
         // 96x160 px source (1 px = 1 dot at 12x20 mm, 8 dots/mm): a filled
@@ -402,7 +375,8 @@ mod tests {
             [1200, 2000],       // 12x20 mm
             &jpeg,
             1,
-        );
+        )
+        .await;
         result.expect("E-series IPP jpeg job failed");
     }
 }

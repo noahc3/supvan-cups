@@ -10,7 +10,6 @@ use crate::error::{Error, Result};
 use crate::speed::calc_speed;
 use crate::status::{MaterialInfo, PrinterStatus};
 use crate::transport::Transport;
-use std::os::unix::io::RawFd;
 use std::time::Duration;
 
 /// Status-poll attempt budgets for the print state machine; each is multiplied
@@ -53,9 +52,16 @@ impl Printer {
     /// Open a Bluetooth printer at the given RFCOMM address (`AA:BB:CC:DD:EE:FF`).
     pub fn open_bt(addr: &str) -> Result<Self> {
         let sock = crate::rfcomm::RfcommSocket::connect_default(addr)?;
-        Ok(Self::new(Box::new(crate::bt_transport::BtTransport::new(
-            sock,
-        ))))
+        Ok(Self::new(Box::new(crate::spp_pipe::SppCodec::new(sock))))
+    }
+
+    /// Open a BLE GATT printer by address (E11/E12-class hardware). Async
+    /// because the `bluer` GATT client is natively async. Requires the `ble`
+    /// feature.
+    #[cfg(feature = "ble")]
+    pub async fn open_ble(addr: &str) -> Result<Self> {
+        let pipe = crate::ble::BlePipe::connect(addr).await?;
+        Ok(Self::new(Box::new(crate::spp_pipe::SppCodec::new(pipe))))
     }
 
     /// Open a printer from a target string: a `/dev/hidrawN` path selects USB
@@ -68,54 +74,44 @@ impl Printer {
         }
     }
 
-    /// Return the raw file descriptor of the underlying transport.
-    pub fn raw_fd(&self) -> RawFd {
-        self.transport.raw_fd()
-    }
-
-    /// Whether the transport uses socket I/O (recv/send) vs file I/O (read/write).
-    pub fn use_socket_io(&self) -> bool {
-        self.transport.use_socket_io()
-    }
-
     /// CHECK_DEVICE (0x12) - verify printer is present.
-    pub fn check_device(&self) -> Result<bool> {
+    pub async fn check_device(&self) -> Result<bool> {
         log::info!("CHECK_DEVICE");
-        let resp = self.transport.send_cmd(CMD_CHECK_DEVICE, 0)?;
+        let resp = self.transport.send_cmd(CMD_CHECK_DEVICE, 0).await?;
         Ok(resp.is_some_and(|r| self.transport.validate_response(&r, CMD_CHECK_DEVICE)))
     }
 
     /// INQUIRY_STA (0x11) - query printer status.
-    pub fn query_status(&self) -> Result<Option<PrinterStatus>> {
-        let resp = self.transport.send_cmd(CMD_INQUIRY_STA, 0)?;
+    pub async fn query_status(&self) -> Result<Option<PrinterStatus>> {
+        let resp = self.transport.send_cmd(CMD_INQUIRY_STA, 0).await?;
         Ok(resp.and_then(|r| self.transport.parse_status_response(&r)))
     }
 
     /// RETURN_MAT (0x30) - query material/label info.
-    pub fn query_material(&self) -> Result<Option<MaterialInfo>> {
+    pub async fn query_material(&self) -> Result<Option<MaterialInfo>> {
         log::info!("RETURN_MAT");
-        let resp = self.transport.send_cmd(CMD_RETURN_MAT, 0)?;
+        let resp = self.transport.send_cmd(CMD_RETURN_MAT, 0).await?;
         Ok(resp.and_then(|r| self.transport.parse_material_response(&r)))
     }
 
     /// RD_DEV_NAME (0x16) - read device name.
-    pub fn read_device_name(&self) -> Result<Option<String>> {
+    pub async fn read_device_name(&self) -> Result<Option<String>> {
         log::info!("RD_DEV_NAME");
-        let resp = self.transport.send_cmd(CMD_RD_DEV_NAME, 0)?;
+        let resp = self.transport.send_cmd(CMD_RD_DEV_NAME, 0).await?;
         Ok(resp.and_then(|r| self.transport.parse_device_name_response(&r)))
     }
 
     /// READ_FWVER (0xC5) - read firmware version.
-    pub fn read_firmware_version(&self) -> Result<Option<u8>> {
+    pub async fn read_firmware_version(&self) -> Result<Option<u8>> {
         log::info!("READ_FWVER");
-        let resp = self.transport.send_cmd(CMD_READ_FWVER, 0)?;
+        let resp = self.transport.send_cmd(CMD_READ_FWVER, 0).await?;
         Ok(resp.and_then(|r| self.transport.parse_firmware_version_response(&r)))
     }
 
     /// READ_REV (0x17) - read protocol version.
-    pub fn read_version(&self) -> Result<Option<String>> {
+    pub async fn read_version(&self) -> Result<Option<String>> {
         log::info!("READ_REV");
-        let resp = self.transport.send_cmd(CMD_READ_REV, 0)?;
+        let resp = self.transport.send_cmd(CMD_READ_REV, 0).await?;
         Ok(resp.and_then(|r| self.transport.parse_version_response(&r)))
     }
 
@@ -129,9 +125,9 @@ impl Printer {
     /// framing convention that differs from this crate's BT response buffer, so
     /// the caller dumps and interprets the bytes instead of trusting a guess.
     /// Returns `None` if there is no response or it doesn't echo the command.
-    pub fn read_label_dpi_raw(&self) -> Result<Option<Vec<u8>>> {
+    pub async fn read_label_dpi_raw(&self) -> Result<Option<Vec<u8>>> {
         log::info!("RD_LAB_DPI");
-        let resp = self.transport.send_cmd(CMD_RD_LAB_DPI, 0)?;
+        let resp = self.transport.send_cmd(CMD_RD_LAB_DPI, 0).await?;
         Ok(resp.filter(|r| self.transport.validate_response(r, CMD_RD_LAB_DPI)))
     }
 
@@ -141,9 +137,9 @@ impl Printer {
     /// Diagnostic escape hatch for reverse-engineering unknown command codes
     /// (e.g. probing which DPI-query variant a given model answers). `None`
     /// means the read genuinely timed out with zero bytes received.
-    pub fn send_raw_cmd(&self, cmd: u8, param: u16) -> Result<Option<Vec<u8>>> {
+    pub async fn send_raw_cmd(&self, cmd: u8, param: u16) -> Result<Option<Vec<u8>>> {
         log::info!("RAW CMD 0x{cmd:02X} param={param}");
-        self.transport.send_cmd(cmd, param)
+        self.transport.send_cmd(cmd, param).await
     }
 
     /// START_PRINT (0x13).
@@ -151,28 +147,40 @@ impl Printer {
     /// `param` carries the material-type code on E-series printers
     /// (1=continuous tape, 2=die-cut, 3=plate); the T50 flow uses 0. A wrong
     /// value here engages the feed motor but not the burn mode (blank output).
-    pub fn start_print(&self, param: u16) -> Result<Option<Vec<u8>>> {
+    pub async fn start_print(&self, param: u16) -> Result<Option<Vec<u8>>> {
         log::info!("START_PRINT param={param}");
-        self.transport.send_cmd(CMD_START_PRINT, param)
+        self.transport.send_cmd(CMD_START_PRINT, param).await
     }
 
     /// STOP_PRINT (0x14).
-    pub fn stop_print(&self) -> Result<Option<Vec<u8>>> {
+    pub async fn stop_print(&self) -> Result<Option<Vec<u8>>> {
         log::info!("STOP_PRINT");
-        self.transport.send_cmd(CMD_STOP_PRINT, 0)
+        self.transport.send_cmd(CMD_STOP_PRINT, 0).await
+    }
+
+    /// PAPER_SKIP (0x2E) — feed/advance one blank label. Returns `Ok(())` once
+    /// the device acks; errors if there is no response.
+    pub async fn paper_skip(&self) -> Result<()> {
+        log::info!("PAPER_SKIP");
+        let resp = self.transport.send_cmd(CMD_PAPER_SKIP, 0).await?;
+        if resp.is_some_and(|r| self.transport.validate_response(&r, CMD_PAPER_SKIP)) {
+            Ok(())
+        } else {
+            Err(Error::InvalidResponse("PAPER_SKIP: no ack".into()))
+        }
     }
 
     /// Wait for device to be idle (not busy, not printing).
-    pub fn wait_ready(&self, max_attempts: usize) -> Result<Option<PrinterStatus>> {
+    pub async fn wait_ready(&self, max_attempts: usize) -> Result<Option<PrinterStatus>> {
         for _ in 0..max_attempts {
-            let st = self.query_status()?;
+            let st = self.query_status().await?;
             if let Some(ref s) = st
                 && !s.device_busy
                 && !s.printing
             {
                 return Ok(st);
             }
-            std::thread::sleep(Duration::from_millis(100));
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Ok(None)
     }
@@ -183,9 +191,9 @@ impl Printer {
     /// error flag (label end, cover open, mode mismatch, etc.) — those
     /// states cause the firmware to drop the BT link and beep, and there's
     /// no point continuing the print.
-    pub fn wait_printing(&self, max_attempts: usize) -> Result<Option<PrinterStatus>> {
+    pub async fn wait_printing(&self, max_attempts: usize) -> Result<Option<PrinterStatus>> {
         for _ in 0..max_attempts {
-            let st = self.query_status()?;
+            let st = self.query_status().await?;
             if let Some(ref s) = st {
                 if s.has_error() {
                     return Err(Error::InvalidResponse(format!(
@@ -197,16 +205,16 @@ impl Printer {
                     return Ok(st);
                 }
             }
-            std::thread::sleep(Duration::from_millis(100));
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Ok(None)
     }
 
     /// Wait for buffer space available (buf_full == false).
-    pub fn wait_buffer_ready(&self, max_attempts: usize) -> Result<Option<PrinterStatus>> {
+    pub async fn wait_buffer_ready(&self, max_attempts: usize) -> Result<Option<PrinterStatus>> {
         for i in 0..max_attempts {
-            std::thread::sleep(Duration::from_millis(20));
-            let st = self.query_status()?;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let st = self.query_status().await?;
             if let Some(ref s) = st {
                 if s.has_error() {
                     return Err(Error::InvalidResponse(format!(
@@ -230,27 +238,22 @@ impl Printer {
     ///
     /// The printer's decoder splits the decompressed stream on 4096-byte
     /// boundaries internally, so one transfer covers all the page's buffers.
-    pub fn transfer_compressed(&self, compressed: &[u8], speed: u16) -> Result<()> {
+    pub async fn transfer_compressed(&self, compressed: &[u8], speed: u16) -> Result<()> {
         let compressed_len = compressed.len() as u16;
 
-        // CMD_NEXT_ZIPPEDBULK (0x5C):
-        //   BT:  SendCmdTwo(0x5C, block_size=512, block_count)
-        //   USB: SendCmd(0x5C, total_length)
-        let resp = if self.transport.use_socket_io() {
-            let num_packets = compressed.len().div_ceil(DATA_PAYLOAD_SIZE);
-            log::info!(
-                "transfer: {} bytes, {} packets, speed={}",
-                compressed.len(),
-                num_packets,
-                speed
-            );
-            self.transport
-                .send_cmd_two(CMD_NEXT_ZIPPEDBULK, 512, num_packets as u16)?
-        } else {
-            log::info!("transfer: {} bytes, speed={}", compressed.len(), speed);
-            self.transport
-                .send_cmd(CMD_NEXT_ZIPPEDBULK, compressed_len)?
-        };
+        // CMD_NEXT_ZIPPEDBULK (0x5C): each transport encodes the header in its
+        // own convention (SPP: block_size=512 + packet count; USB: total length).
+        let num_packets = compressed.len().div_ceil(DATA_PAYLOAD_SIZE);
+        log::info!(
+            "transfer: {} bytes, {} packets, speed={}",
+            compressed.len(),
+            num_packets,
+            speed
+        );
+        let resp = self
+            .transport
+            .send_bulk_header(compressed_len, num_packets)
+            .await?;
         if resp.is_none() {
             return Err(Error::InvalidResponse(
                 "no response to NEXT_ZIPPEDBULK".into(),
@@ -263,15 +266,16 @@ impl Printer {
         // here blocks for the read timeout (2s on BT), during which the
         // printer queues the bytes, times out waiting for BUF_FULL, errors
         // (3-beep) and drops the RFCOMM link before BUF_FULL arrives.
-        self.transport.send_bulk_data(compressed, false)?;
+        self.transport.send_bulk_data(compressed, false).await?;
 
         // 20ms delay after last data packet
-        std::thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
 
         // CMD_BUF_FULL: param=compressed_length, param2=speed
         log::info!("BUF_FULL: len={}, speed={}", compressed_len, speed);
         self.transport
-            .send_cmd_two(CMD_BUF_FULL, compressed_len, speed)?;
+            .send_cmd_two(CMD_BUF_FULL, compressed_len, speed)
+            .await?;
 
         Ok(())
     }
@@ -285,15 +289,21 @@ impl Printer {
     /// 4. Wait printing station
     /// 5. Wait buffer ready + transfer
     /// 6. Wait completion
-    pub fn print_compressed(&self, compressed: &[u8], speed: u16, start_param: u16) -> Result<()> {
+    pub async fn print_compressed(
+        &self,
+        compressed: &[u8],
+        speed: u16,
+        start_param: u16,
+    ) -> Result<()> {
         // Step 1: Check device
-        if !self.check_device()? {
+        if !self.check_device().await? {
             return Err(Error::InvalidResponse("CHECK_DEVICE failed".into()));
         }
 
         // Step 2: Wait ready
         let status = self
-            .wait_ready(READY_ATTEMPTS)?
+            .wait_ready(READY_ATTEMPTS)
+            .await?
             .ok_or_else(|| Error::InvalidResponse("timeout waiting for device ready".into()))?;
         if status.has_error() {
             return Err(Error::InvalidResponse(format!(
@@ -303,29 +313,31 @@ impl Printer {
         }
 
         // Step 3: Start print
-        self.start_print(start_param)?;
+        self.start_print(start_param).await?;
 
         // Step 4: Wait printing station
-        self.wait_printing(PRINTING_ATTEMPTS)?
+        self.wait_printing(PRINTING_ATTEMPTS)
+            .await?
             .ok_or_else(|| Error::InvalidResponse("timeout waiting for printing station".into()))?;
 
         // Step 5: Wait buffer + transfer
         let buf_status = self
-            .wait_buffer_ready(BUFFER_READY_ATTEMPTS)?
+            .wait_buffer_ready(BUFFER_READY_ATTEMPTS)
+            .await?
             .ok_or_else(|| Error::InvalidResponse("timeout waiting for buffer space".into()))?;
         if buf_status.has_error() {
-            self.stop_print()?;
+            self.stop_print().await?;
             return Err(Error::InvalidResponse(format!(
                 "printer error: {}",
                 buf_status.error_description().unwrap_or_default()
             )));
         }
-        self.transfer_compressed(compressed, speed)?;
+        self.transfer_compressed(compressed, speed).await?;
 
         // Step 6: Wait completion
         for _ in 0..COMPLETION_POLLS {
-            std::thread::sleep(COMPLETION_POLL_INTERVAL);
-            if let Some(s) = self.query_status()?
+            tokio::time::sleep(COMPLETION_POLL_INTERVAL).await;
+            if let Some(s) = self.query_status().await?
                 && !s.printing
                 && !s.device_busy
             {
@@ -339,7 +351,7 @@ impl Printer {
     }
 
     /// Full test print workflow: generate test pattern, build buffers, compress, print.
-    pub fn test_print(&self, mat: &MaterialInfo, density: u8) -> Result<()> {
+    pub async fn test_print(&self, mat: &MaterialInfo, density: u8) -> Result<()> {
         use crate::bitmap::create_test_pattern;
         use crate::buffer::split_into_buffers;
         use crate::compress::compress_buffers;
@@ -371,7 +383,7 @@ impl Printer {
             speed
         );
 
-        self.print_compressed(&compressed, speed, 0)
+        self.print_compressed(&compressed, speed, 0).await
     }
 
     /// Print a geometry-calibration pattern defined purely in **dots** (no
@@ -388,7 +400,7 @@ impl Printer {
     /// plus 6-dot tick stubs every 10 dots along the top and left edges and a
     /// top-left→bottom-right diagonal (to reveal rotation/mirroring). Measure
     /// the outer border with a ruler: dots_per_mm = width_dots / measured_mm.
-    pub fn calibrate_print(
+    pub async fn calibrate_print(
         &self,
         width_dots: u32,
         length_dots: u32,
@@ -396,12 +408,13 @@ impl Printer {
         mat: u8,
     ) -> Result<()> {
         self.calibrate_print_opts(width_dots, length_dots, density, mat, false, 1)
+            .await
     }
 
     /// As [`calibrate_print`], but `solid` fills the entire area (every dot on)
     /// instead of drawing the border/tick pattern — the clearest test of
     /// whether the head burns at all and at what darkness.
-    pub fn calibrate_print_opts(
+    pub async fn calibrate_print_opts(
         &self,
         width_dots: u32,
         length_dots: u32,
@@ -461,7 +474,7 @@ impl Printer {
 
         let (compressed, avg) = compress_buffers(&buffers)?;
         let speed = calc_speed(avg);
-        self.print_compressed(&compressed, speed, start_param)
+        self.print_compressed(&compressed, speed, start_param).await
     }
 
     /// Execute an E-series (E10pro) print, byte-faithful to the captured
@@ -484,7 +497,7 @@ impl Printer {
     /// page, mirroring the two-stage handshake the firmware expects. If a
     /// single page double-prints, the single-page flow needs its own capture.
     /// The `0xC9`/`0xBA` params are reproduced as captured constants.
-    pub fn print_eseries(
+    pub async fn print_eseries(
         &self,
         pages: &[Vec<[u8; crate::buffer::PRINT_BUF_SIZE]>],
         total_feed_cols: u16,
@@ -493,21 +506,17 @@ impl Printer {
         use crate::compress::compress_page_e;
         use crate::data::DATA_PAYLOAD_SIZE;
 
-        if !self.use_socket_io() {
-            return Err(Error::InvalidParam(
-                "E-series printing is Bluetooth only".into(),
-            ));
-        }
         if pages.is_empty() || pages[0].is_empty() {
             return Err(Error::InvalidParam("no pages/buffers".into()));
         }
 
         // Step 1: CHECK_DEVICE + wait ready.
-        if !self.check_device()? {
+        if !self.check_device().await? {
             return Err(Error::InvalidResponse("CHECK_DEVICE failed".into()));
         }
         let status = self
-            .wait_ready(READY_ATTEMPTS)?
+            .wait_ready(READY_ATTEMPTS)
+            .await?
             .ok_or_else(|| Error::InvalidResponse("timeout waiting for device ready".into()))?;
         if status.has_error() {
             return Err(Error::InvalidResponse(format!(
@@ -536,27 +545,30 @@ impl Printer {
             0x02, 0x00, 0x00, 0x02, 0x00, 0x00, fc[0], fc[1], 0x03, 0x00, 0x00, 0x00, 0x00,
         ];
         self.transport
-            .send_raw_cmd_frame(&make_cmd_ext(0xD0, &d0_params))?;
+            .send_raw_cmd_frame(&make_cmd_ext(0xD0, &d0_params))
+            .await?;
 
         // Step 3: 0xD1 carries the first page.
-        self.transport.send_eseries_bulk(0xD1, &page_lzma[0])?;
+        self.transport.send_eseries_bulk(0xD1, &page_lzma[0]).await?;
 
         // Step 4: 0xB0 carries the current date as ASCII "YYYYMMDD" then zeros.
         let mut b0_params = current_date_yyyymmdd().into_bytes();
         b0_params.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
         self.transport
-            .send_raw_cmd_frame(&make_cmd_ext(0xB0, &b0_params))?;
+            .send_raw_cmd_frame(&make_cmd_ext(0xB0, &b0_params))
+            .await?;
 
         // Step 5: 0xC9 (captured param 0x006e). Empirical constant.
-        self.transport.send_cmd(0xC9, 0x006e)?;
+        self.transport.send_cmd(0xC9, 0x006e).await?;
 
         // Step 6: START_PRINT with param 0 (NOT a material-type code).
-        self.start_print(0)?;
-        self.wait_printing(PRINTING_ATTEMPTS)?
+        self.start_print(0).await?;
+        self.wait_printing(PRINTING_ATTEMPTS)
+            .await?
             .ok_or_else(|| Error::InvalidResponse("timeout waiting for printing station".into()))?;
 
         // Step 7: 0xBA (captured param 0x0019). Empirical constant.
-        self.transport.send_cmd(0xBA, 0x0019)?;
+        self.transport.send_cmd(0xBA, 0x0019).await?;
 
         // Step 8: subsequent pages via 0x5C handshake + 0xBB bulk. For a single
         // page, the captured second page is absent; we still emit one 0xBB pass
@@ -569,28 +581,30 @@ impl Printer {
         for lzma in bb_pages {
             let num_chunks = lzma.len().div_ceil(DATA_PAYLOAD_SIZE).max(1);
             self.transport
-                .send_cmd_two(CMD_NEXT_ZIPPEDBULK, 512, num_chunks as u16)?;
+                .send_cmd_two(CMD_NEXT_ZIPPEDBULK, 512, num_chunks as u16)
+                .await?;
             let buf_status = self
-                .wait_buffer_ready(BUFFER_READY_ATTEMPTS)?
+                .wait_buffer_ready(BUFFER_READY_ATTEMPTS)
+                .await?
                 .ok_or_else(|| Error::InvalidResponse("timeout waiting for buffer space".into()))?;
             if buf_status.has_error() {
-                self.stop_print()?;
+                self.stop_print().await?;
                 return Err(Error::InvalidResponse(format!(
                     "printer error: {}",
                     buf_status.error_description().unwrap_or_default()
                 )));
             }
-            self.transport.send_eseries_bulk(0xBB, lzma)?;
+            self.transport.send_eseries_bulk(0xBB, lzma).await?;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
 
         // Step 9: BUF_FULL with BOTH params zero (captured), not (len, speed).
-        self.transport.send_cmd_two(CMD_BUF_FULL, 0, 0)?;
+        self.transport.send_cmd_two(CMD_BUF_FULL, 0, 0).await?;
 
         // Step 10: wait completion.
         for _ in 0..COMPLETION_POLLS {
-            std::thread::sleep(COMPLETION_POLL_INTERVAL);
-            if let Some(s) = self.query_status()?
+            tokio::time::sleep(COMPLETION_POLL_INTERVAL).await;
+            if let Some(s) = self.query_status().await?
                 && !s.printing
                 && !s.device_busy
             {
@@ -613,7 +627,7 @@ impl Printer {
     /// reduced by that gap to make equal `lead_feed`/`trail_feed` values yield
     /// visually equal margins on both ends.
     #[allow(clippy::too_many_arguments)]
-    pub fn calibrate_print_e(
+    pub async fn calibrate_print_e(
         &self,
         width_dots: u32,
         length_dots: u32,
@@ -674,7 +688,7 @@ impl Printer {
         // All `total_len` raster columns ship as image data (lead/trail blank
         // included), matching the app; header margins stay at opts (1/1).
         let buffers = split_into_buffers_e(&buf, bytes_per_line as u8, total_len as u16, opts);
-        self.print_eseries(&[buffers], total_len as u16)
+        self.print_eseries(&[buffers], total_len as u16).await
     }
 }
 

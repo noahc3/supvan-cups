@@ -20,6 +20,7 @@ pub const CMD_READ_REV: u8 = 0x17;
 /// flow the rest of this crate implements; used by the `dpi` diagnostic to
 /// determine non-T50 (e.g. E-series tape) printer geometry.
 pub const CMD_RD_LAB_DPI: u8 = 0x22;
+pub const CMD_PAPER_SKIP: u8 = 0x2E;
 pub const CMD_RETURN_MAT: u8 = 0x30;
 pub const CMD_NEXT_ZIPPEDBULK: u8 = 0x5C;
 pub const CMD_READ_FWVER: u8 = 0xC5;

@@ -7,7 +7,6 @@ use crate::error::{Error, Result};
 use crate::hidraw::{HID_REPORT_SIZE, HidrawDevice};
 use crate::status::{MaterialInfo, PrinterStatus};
 use crate::transport::Transport;
-use std::os::unix::io::RawFd;
 use std::time::Duration;
 
 /// USB HID command magic bytes.
@@ -133,36 +132,42 @@ impl UsbHidTransport {
     }
 }
 
+#[async_trait::async_trait]
 impl Transport for UsbHidTransport {
-    fn send_cmd(&self, cmd: u8, param: u16) -> Result<Option<Vec<u8>>> {
+    async fn send_cmd(&self, cmd: u8, param: u16) -> Result<Option<Vec<u8>>> {
         let frame = Self::make_usb_cmd(cmd, param);
-        self.send_and_recv(&frame)
+        tokio::task::block_in_place(|| self.send_and_recv(&frame))
     }
 
-    fn send_cmd_two(&self, cmd: u8, param1: u16, param2: u16) -> Result<Option<Vec<u8>>> {
+    async fn send_cmd_two(&self, cmd: u8, param1: u16, param2: u16) -> Result<Option<Vec<u8>>> {
         let frame = Self::make_usb_cmd_two(cmd, param1, param2);
-        self.send_and_recv(&frame)
+        tokio::task::block_in_place(|| self.send_and_recv(&frame))
     }
 
-    fn send_bulk_data(&self, data: &[u8], read_final_response: bool) -> Result<Option<Vec<u8>>> {
-        // Split raw compressed bytes into 64-byte HID reports.
-        let chunks = data.chunks(HID_REPORT_SIZE);
-        let total = chunks.len();
-        for (i, chunk) in data.chunks(HID_REPORT_SIZE).enumerate() {
-            let is_last = i == total - 1;
-            if is_last && read_final_response {
-                return self.send_and_recv(chunk);
+    async fn send_bulk_data(
+        &self,
+        data: &[u8],
+        read_final_response: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        tokio::task::block_in_place(|| {
+            // Split raw compressed bytes into 64-byte HID reports.
+            let total = data.chunks(HID_REPORT_SIZE).count();
+            for (i, chunk) in data.chunks(HID_REPORT_SIZE).enumerate() {
+                let is_last = i == total - 1;
+                if is_last && read_final_response {
+                    return self.send_and_recv(chunk);
+                }
+                self.dev.write_report(chunk)?;
+                // Small delay between reports to avoid overwhelming the device
+                if !is_last {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
-            self.dev.write_report(chunk)?;
-            // Small delay between reports to avoid overwhelming the device
-            if !is_last {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-        Ok(None)
+            Ok(None)
+        })
     }
 
-    fn send_eseries_bulk(&self, _cmd: u8, _lzma: &[u8]) -> Result<Option<Vec<u8>>> {
+    async fn send_eseries_bulk(&self, _cmd: u8, _lzma: &[u8]) -> Result<Option<Vec<u8>>> {
         // The E-series (E10pro) is Bluetooth-only; there is no USB E-series
         // printer to capture/verify against, so this path is unsupported.
         Err(Error::InvalidParam(
@@ -170,18 +175,20 @@ impl Transport for UsbHidTransport {
         ))
     }
 
-    fn send_raw_cmd_frame(&self, _frame: &[u8]) -> Result<Option<Vec<u8>>> {
+    async fn send_raw_cmd_frame(&self, _frame: &[u8]) -> Result<Option<Vec<u8>>> {
         Err(Error::InvalidParam(
             "E-series raw command frames are not supported over USB".into(),
         ))
     }
 
-    fn raw_fd(&self) -> RawFd {
-        self.dev.raw_fd()
-    }
-
-    fn use_socket_io(&self) -> bool {
-        false
+    async fn send_bulk_header(
+        &self,
+        compressed_len: u16,
+        _num_packets: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        // USB HID encodes NEXT_ZIPPEDBULK as the total compressed byte length.
+        self.send_cmd(crate::cmd::CMD_NEXT_ZIPPEDBULK, compressed_len)
+            .await
     }
 
     fn parse_status_response(&self, resp: &[u8]) -> Option<PrinterStatus> {

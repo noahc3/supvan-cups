@@ -16,15 +16,17 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use supvan_proto::printer::Printer;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::battery_provider;
 use crate::printer_device::KsDevice;
 
 /// BT printer connection cache, keyed by address. Persists across `open_bt`
 /// calls so the status poller and print jobs reuse one RFCOMM socket per
-/// printer.
-fn bt_cache() -> &'static Mutex<HashMap<String, Arc<Mutex<Printer>>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Arc<Mutex<Printer>>>>> = OnceLock::new();
+/// printer. The outer `Mutex` guards the map (held briefly, sync); each printer
+/// sits behind an async `Mutex` so a device op can be awaited while held.
+fn bt_cache() -> &'static Mutex<HashMap<String, Arc<AsyncMutex<Printer>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<Printer>>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -42,21 +44,24 @@ fn dial_bt(addr: &str) -> Option<Printer> {
 /// Open `btrfcomm://host/path/AA:BB:CC:DD:EE:FF`, reusing a cached RFCOMM
 /// socket when one is available. Drops the cache entry and reconnects if the
 /// existing socket no longer responds.
-pub fn open_bt(uri: &str) -> Option<Box<KsDevice>> {
+pub async fn open_bt(uri: &str) -> Option<Box<KsDevice>> {
     let addr = uri
         .strip_prefix("btrfcomm://")
         .and_then(|rest| rest.find('/').map(|pos| &rest[pos + 1..]))?;
 
+    // `await` can't appear in a match guard, so validate the cached socket
+    // before deciding whether to reuse it.
     let cached = bt_cache().lock().unwrap().get(addr).cloned();
     let printer = match cached {
-        Some(arc) if arc.lock().unwrap().check_device().unwrap_or(false) => {
-            log::debug!("device::open_bt: reusing cached socket for {addr}");
-            arc
-        }
-        Some(_) => {
-            log::info!("device::open_bt: cached socket for {addr} is dead, reconnecting");
-            bt_cache().lock().unwrap().remove(addr);
-            dial_and_cache(addr)?
+        Some(arc) => {
+            if arc.lock().await.check_device().await.unwrap_or(false) {
+                log::debug!("device::open_bt: reusing cached socket for {addr}");
+                arc
+            } else {
+                log::info!("device::open_bt: cached socket for {addr} is dead, reconnecting");
+                bt_cache().lock().unwrap().remove(addr);
+                dial_and_cache(addr)?
+            }
         }
         None => dial_and_cache(addr)?,
     };
@@ -69,8 +74,8 @@ pub fn open_bt(uri: &str) -> Option<Box<KsDevice>> {
 
 /// Dial a fresh RFCOMM socket for `addr` and insert it into the connection
 /// cache, returning the shared handle.
-fn dial_and_cache(addr: &str) -> Option<Arc<Mutex<Printer>>> {
-    let arced = Arc::new(Mutex::new(dial_bt(addr)?));
+fn dial_and_cache(addr: &str) -> Option<Arc<AsyncMutex<Printer>>> {
+    let arced = Arc::new(AsyncMutex::new(dial_bt(addr)?));
     bt_cache()
         .lock()
         .unwrap()
@@ -81,9 +86,9 @@ fn dial_and_cache(addr: &str) -> Option<Arc<Mutex<Printer>>> {
 /// Open a device from its URI, dispatching on the scheme: `supvan://` resolves
 /// through the discovery transport map, `mock://` yields a simulator device.
 /// Any other scheme is unsupported and returns `None`.
-pub fn open_uri(uri: &str) -> Option<KsDevice> {
+pub async fn open_uri(uri: &str) -> Option<KsDevice> {
     if uri.starts_with("supvan://") {
-        open_supvan(uri)
+        open_supvan(uri).await
     } else if uri.starts_with("mock://") {
         open_mock(uri)
     } else {
@@ -109,6 +114,7 @@ pub fn open_mock(_uri: &str) -> Option<KsDevice> {
 struct SupvanTransports {
     hidraw_path: Option<String>,
     bt_address: Option<String>,
+    ble_address: Option<String>,
 }
 
 fn supvan_map() -> &'static Mutex<HashMap<String, SupvanTransports>> {
@@ -119,12 +125,18 @@ fn supvan_map() -> &'static Mutex<HashMap<String, SupvanTransports>> {
 /// Record the active USB and/or BT transports for a `supvan://<slug>` printer.
 /// Called from [`crate::ipp_server::SupvanDeviceBackend::list`] after each
 /// discovery cycle.
-pub fn register_supvan(slug: &str, hidraw_path: Option<String>, bt_address: Option<String>) {
+pub fn register_supvan(
+    slug: &str,
+    hidraw_path: Option<String>,
+    bt_address: Option<String>,
+    ble_address: Option<String>,
+) {
     supvan_map().lock().unwrap().insert(
         slug.to_string(),
         SupvanTransports {
             hidraw_path,
             bt_address,
+            ble_address,
         },
     );
 }
@@ -132,7 +144,7 @@ pub fn register_supvan(slug: &str, hidraw_path: Option<String>, bt_address: Opti
 /// Open `supvan://<slug>`. Prefers USB when available, falls back to the
 /// cached BT socket. Returns `None` if neither transport is registered or
 /// both fail to open.
-pub fn open_supvan(uri: &str) -> Option<KsDevice> {
+pub async fn open_supvan(uri: &str) -> Option<KsDevice> {
     let slug = uri.strip_prefix("supvan://")?;
     let entry = supvan_map().lock().unwrap().get(slug).cloned()?;
 
@@ -145,8 +157,66 @@ pub fn open_supvan(uri: &str) -> Option<KsDevice> {
     if let Some(addr) = entry.bt_address.as_deref() {
         // open_bt expects a full URI; synthesize one.
         let uri = format!("btrfcomm://bt/{addr}");
-        return open_bt(&uri).map(|b| *b);
+        if let Some(dev) = open_bt(&uri).await {
+            return Some(*dev);
+        }
+        log::warn!("open_supvan: BT open failed for {slug} ({addr}), trying BLE");
+    }
+    if let Some(addr) = entry.ble_address.as_deref() {
+        return open_ble_addr(addr).await.map(|b| *b);
     }
     log::warn!("open_supvan: no transports for {slug}");
     None
+}
+
+/// Open a BLE printer by address, reusing a cached GATT connection. Stub
+/// (returns `None`) without the `ble` feature.
+#[cfg(feature = "ble")]
+async fn open_ble_addr(addr: &str) -> Option<Box<KsDevice>> {
+    let cached = ble_cache().lock().unwrap().get(addr).cloned();
+    let printer = match cached {
+        Some(arc) => {
+            if arc.lock().await.check_device().await.unwrap_or(false) {
+                log::debug!("device::open_ble: reusing cached connection for {addr}");
+                arc
+            } else {
+                log::info!("device::open_ble: cached connection for {addr} dead, reconnecting");
+                ble_cache().lock().unwrap().remove(addr);
+                dial_ble_and_cache(addr).await?
+            }
+        }
+        None => dial_ble_and_cache(addr).await?,
+    };
+    Some(Box::new(KsDevice::from_shared(printer)))
+}
+
+#[cfg(not(feature = "ble"))]
+async fn open_ble_addr(addr: &str) -> Option<Box<KsDevice>> {
+    log::warn!("device: BLE address {addr} registered but the `ble` feature is off");
+    None
+}
+
+/// BLE printer connection cache, mirroring [`bt_cache`].
+#[cfg(feature = "ble")]
+fn ble_cache() -> &'static Mutex<HashMap<String, Arc<AsyncMutex<Printer>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<Printer>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "ble")]
+async fn dial_ble_and_cache(addr: &str) -> Option<Arc<AsyncMutex<Printer>>> {
+    log::info!("device::open_ble: connecting {addr} (no cache entry)");
+    let printer = match Printer::open_ble(addr).await {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("device::open_ble: GATT connect failed for {addr}: {e}");
+            return None;
+        }
+    };
+    let arced = Arc::new(AsyncMutex::new(printer));
+    ble_cache()
+        .lock()
+        .unwrap()
+        .insert(addr.to_string(), arced.clone());
+    Some(arced)
 }

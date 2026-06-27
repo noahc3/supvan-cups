@@ -278,6 +278,29 @@ impl Drop for RfcommSocket {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::spp_pipe::SppPipe for RfcommSocket {
+    async fn send_cmd_frame(&self, frame: &[u8; 16]) -> Result<Option<Vec<u8>>> {
+        // Blocking libc socket I/O: run in place so concurrent tasks (status
+        // polling, IPP serving) migrate off this worker during the round-trip.
+        tokio::task::block_in_place(|| self.send_cmd(frame))
+    }
+
+    async fn send_data_frame(
+        &self,
+        frame: &[u8; 512],
+        read_response: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        tokio::task::block_in_place(|| RfcommSocket::send_data_frame(self, frame, read_response))
+    }
+
+    async fn send_raw_frame(&self, frame: &[u8]) -> Result<Option<Vec<u8>>> {
+        // Blocking libc socket I/O: bridge via block_in_place like the other
+        // frame ops. `RfcommSocket::send_raw_frame` is the inherent method.
+        tokio::task::block_in_place(|| RfcommSocket::send_raw_frame(self, frame))
+    }
+}
+
 /// Parse a Bluetooth address string "XX:XX:XX:XX:XX:XX" into 6 bytes.
 /// BlueZ uses reversed byte order (LSB first).
 fn parse_bdaddr(addr: &str) -> Result<[u8; 6]> {

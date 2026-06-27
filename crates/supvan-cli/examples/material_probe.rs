@@ -11,10 +11,10 @@
 
 use std::env;
 
-use supvan_proto::bt_transport::BtTransport;
 use supvan_proto::cmd::CMD_RETURN_MAT;
 use supvan_proto::hidraw::HidrawDevice;
 use supvan_proto::rfcomm::RfcommSocket;
+use supvan_proto::spp_pipe::SppCodec;
 use supvan_proto::transport::Transport;
 use supvan_proto::usb_transport::UsbHidTransport;
 
@@ -53,7 +53,8 @@ fn find_serial(label: &str, bytes: &[u8], needle: &str) {
     }
 }
 
-fn main() {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
         eprintln!("usage: material_probe <hidraw> <bt_mac> <known_serial>");
@@ -68,14 +69,16 @@ fn main() {
 
     println!("(dialing BT — expect one beep)");
     let sock = RfcommSocket::connect_default(bt_mac).expect("rfcomm connect");
-    let bt_t = BtTransport::new(sock);
+    let bt_t = SppCodec::new(sock);
 
     let usb_resp = usb_t
         .send_cmd(CMD_RETURN_MAT, 0)
+        .await
         .expect("usb send")
         .unwrap_or_default();
     let bt_resp = bt_t
         .send_cmd(CMD_RETURN_MAT, 0)
+        .await
         .expect("bt send")
         .unwrap_or_default();
 
