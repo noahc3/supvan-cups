@@ -118,16 +118,31 @@ impl DeviceBackend for SupvanDeviceBackend {
         }
 
         for (name, (usb, bt)) in by_name {
-            let model = usb
+            // Resolve the driver family from the printer-reported name. Both the
+            // USB model string (e.g. "T50M Pro") and the BT firmware name (e.g.
+            // "T0132F2501032470") feed `family_for_model_hint`, which substring-
+            // matches the bt_patterns table (so "t0132" -> e10pro, "t50" -> T50).
+            // The MDL we emit MUST be the matched family's make_and_model: it is
+            // the single key `driver_for_device`/`config_from_family` use to pick
+            // the family — and thus the printhead width and E-series vs T50 print
+            // path. Hardcoding "T50 Series" here is what made E10pro jobs dispatch
+            // as T50 and print blank.
+            let hint = usb
                 .as_ref()
                 .map(|u| u.model_name.clone())
-                .or_else(|| bt.as_ref().map(|_| "T50 Series".to_string()))
-                .unwrap_or_else(|| "T50 Series".to_string());
+                .unwrap_or_else(|| name.clone());
+            let family = models::family_for_model_hint(&hint);
+            let model = String::from_utf8_lossy(&family.make_and_model).into_owned();
+            let driver = family.driver_name.to_string_lossy();
             let info = format!("Supvan {model} {name}");
             let uri = format!("supvan://{}", slug(&name));
-            let device_id = format!("MFG:Supvan;MDL:{model};CMD:SUPVAN;");
+            // DRV carries the resolved driver_name verbatim so `driver_for_device`
+            // can select the family exactly, instead of re-deriving it from the
+            // human-readable MDL string (whose substring match is fragile — e.g.
+            // "Supvan G Series" contains none of the g11/g15/g18 patterns).
+            let device_id = format!("MFG:Supvan;MDL:{model};DRV:{driver};CMD:SUPVAN;");
             log::info!(
-                "discover: emitting {uri} (usb={}, bt={})",
+                "discover: emitting {uri} (model={model}, driver={driver}, usb={}, bt={})",
                 usb.is_some(),
                 bt.is_some(),
             );
@@ -241,6 +256,15 @@ impl DeviceBackend for SupvanDeviceBackend {
     }
 
     fn driver_for_device(&self, device_id: &str, device_uri: &str) -> Option<String> {
+        // Prefer the explicit DRV field (set by our own discovery emit). It is
+        // the resolved driver_name verbatim, so no re-derivation is needed.
+        if let Some(drv) = models::parse_device_id_field(device_id, "DRV")
+            && models::driver_exists(drv)
+        {
+            return Some(drv.to_string());
+        }
+        // Fall back to MDL-hint matching for foreign device IDs (e.g. a real
+        // IEEE-1284 string from a USB probe that lacks our DRV field).
         if !device_id.is_empty()
             && let Some(mdl) = models::parse_mdl(device_id)
         {

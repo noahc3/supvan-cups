@@ -266,13 +266,36 @@ pub fn is_matching_bt_name(name: &str) -> bool {
         .any(|(pattern, _)| lower.contains(pattern.as_str()))
 }
 
+/// Parse a named field from an IEEE 1284 device ID string.
+///
+/// Fields are `KEY:VALUE` segments separated by `;`. Matching is
+/// case-sensitive on the key, and surrounding whitespace on the value is
+/// trimmed. Example: `parse_device_id_field("MFG:Supvan;MDL:E10pro;", "MDL")`
+/// → `Some("E10pro")`.
+pub fn parse_device_id_field<'a>(device_id: &'a str, key: &str) -> Option<&'a str> {
+    device_id.split(';').find_map(|field| {
+        let (k, v) = field.split_once(':')?;
+        if k.trim() == key {
+            Some(v.trim())
+        } else {
+            None
+        }
+    })
+}
+
+/// True if `driver` names a known driver family.
+pub fn driver_exists(driver: &str) -> bool {
+    registry()
+        .families
+        .iter()
+        .any(|f| f.driver_name.to_str().map(|n| n == driver).unwrap_or(false))
+}
+
 /// Parse the MDL field from an IEEE 1284 device ID string.
 ///
 /// Example: `"MFG:Supvan;MDL:T50M Pro;CMD:SUPVAN;"` → `Some("T50M Pro")`
 pub fn parse_mdl(device_id: &str) -> Option<&str> {
-    device_id
-        .split(';')
-        .find_map(|field| field.strip_prefix("MDL:"))
+    parse_device_id_field(device_id, "MDL")
 }
 
 #[cfg(test)]
@@ -337,5 +360,27 @@ mod tests {
             family_for_model_hint("T0117").driver_name.to_string_lossy(),
             "supvan_t50"
         );
+    }
+
+    #[test]
+    fn test_parse_device_id_field() {
+        // DRV is the load-bearing field discovery now emits; MDL is human-
+        // readable. Both must parse, with whitespace trimmed.
+        let id = "MFG:Supvan;MDL:Supvan E10pro / E-series;DRV:supvan_e10pro;CMD:SUPVAN;";
+        assert_eq!(parse_device_id_field(id, "DRV"), Some("supvan_e10pro"));
+        assert_eq!(
+            parse_device_id_field(id, "MDL"),
+            Some("Supvan E10pro / E-series")
+        );
+        assert_eq!(parse_mdl(id), Some("Supvan E10pro / E-series"));
+        assert_eq!(parse_device_id_field(id, "NOPE"), None);
+    }
+
+    #[test]
+    fn test_driver_exists() {
+        init();
+        assert!(driver_exists("supvan_e10pro"));
+        assert!(driver_exists("supvan_t50"));
+        assert!(!driver_exists("supvan_nonexistent"));
     }
 }
