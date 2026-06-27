@@ -22,10 +22,22 @@ const MAX_DENSITY: i32 = 15;
 /// T50 (`docs/E_SERIES_PROTOCOL.md`).
 const ESERIES_DRIVER: &str = "supvan_e10pro";
 
-/// E-series burn-energy ceiling (byte 12 in the print-buffer header). Captured
-/// working value was 23; darkness 0-100% scales onto 0..=ESERIES_MAX_ENERGY,
-/// bypassing the T50 MAX_DENSITY=15 clamp that caused blank E-series output.
-const ESERIES_MAX_ENERGY: i32 = 31;
+/// Trailing blank dot-columns appended to E-series jobs so the trailing margin
+/// visually matches the fixed ~3 mm mechanical printhead→cutter gap that always
+/// lands on the leading edge ([`supvan_proto`] `HEAD_CUTTER_GAP_DOTS` = 24). The
+/// production IPP path otherwise adds no feed; without this pad a label prints
+/// flush to the cutter on the trailing side but ~3 mm in on the leading side,
+/// looking lopsided. 24 dots ≈ 3 mm at the E10pro's ~8 dots/mm.
+const ESERIES_TRAIL_PAD_DOTS: u32 = 24;
+
+/// E-series burn energy (byte 12 in the print-buffer header). This unit's
+/// thermal head is effectively 1-bit: a live sweep of energy 1..=31 produced
+/// identical fully-black output on both solid fills and fine 2px features, so
+/// energy is NOT a usable darkness/gradient knob — grayscale comes entirely
+/// from dithering ([`crate::dither`]). We pin the captured vendor value (23) to
+/// match the app exactly and keep a safe burn margin (e.g. at higher speeds).
+/// Darkness is applied in the dither LUT, not here. (`docs/E_SERIES_PROTOCOL.md`.)
+const ESERIES_ENERGY: u8 = 23;
 
 /// Poll cadence and budget while waiting for print completion
 /// (COMPLETION_POLLS × COMPLETION_POLL_INTERVAL = 30s).
@@ -130,8 +142,9 @@ pub struct KsJob {
     pub density: u8,
     pub printhead_width_dots: u32,
     pub pgm_acc: Option<PgmAccumulator>,
-    /// E-series (E10pro) burn energy (byte 12), derived from darkness. `Some`
-    /// selects the E-series buffer/transfer path; `None` is the T50 path.
+    /// E-series (E10pro) burn energy (byte 12), pinned to [`ESERIES_ENERGY`]
+    /// (the head is 1-bit; energy doesn't modulate darkness). `Some` selects
+    /// the E-series buffer/transfer path; `None` is the T50 path.
     pub eseries_energy: Option<u8>,
 }
 
@@ -196,7 +209,7 @@ impl KsJob {
             self.bytes_per_line,
         );
 
-        let (col_data, num_cols, _) =
+        let (col_data, mut num_cols, _) =
             raster_to_column_major(&self.raster_data, self.width, self.height);
 
         // Pack into the printhead canvas. The E-series (E10pro) packs exactly
@@ -205,7 +218,17 @@ impl KsJob {
         // (`docs/E_SERIES_PROTOCOL.md`). The T50 centers content in its fixed
         // 384-dot head canvas.
         let (canvas, canvas_bpl) = if self.eseries_energy.is_some() {
-            eseries_pack(&col_data, num_cols, self.width, self.printhead_width_dots)
+            let (packed, bpl) =
+                eseries_pack(&col_data, num_cols, self.width, self.printhead_width_dots);
+            // Append blank trailing columns to balance the fixed mechanical
+            // leading gap (see ESERIES_TRAIL_PAD_DOTS). The canvas is column-
+            // major with `bpl` bytes per column, so padding is just appended
+            // zero bytes; `num_cols` grows to match.
+            let pad_cols = ESERIES_TRAIL_PAD_DOTS;
+            let mut padded = packed;
+            padded.resize(padded.len() + pad_cols as usize * bpl as usize, 0);
+            num_cols += pad_cols;
+            (padded, bpl)
         } else {
             center_in_printhead(&col_data, num_cols, self.width, self.printhead_width_dots)
         };
@@ -349,10 +372,12 @@ impl RasterDriver for KsJob {
         let density = ((darkness * MAX_DENSITY + 50) / 100) as u8;
         let printhead_width_dots = printer.printhead_width_dots();
 
-        // E-series (E10pro) uses a distinct buffer/transfer path with an
-        // independent, unclamped energy byte; scale darkness onto its range.
+        // E-series (E10pro) uses a distinct buffer/transfer path. Its head is
+        // 1-bit (energy doesn't modulate darkness — see ESERIES_ENERGY), so we
+        // pin the captured energy and let dithering carry the darkness. `Some`
+        // here is also the dispatch flag selecting the E-series print path.
         let eseries_energy = if printer.driver_name() == ESERIES_DRIVER {
-            Some(((darkness * ESERIES_MAX_ENERGY + 50) / 100).clamp(0, ESERIES_MAX_ENERGY) as u8)
+            Some(ESERIES_ENERGY)
         } else {
             None
         };
@@ -444,5 +469,27 @@ mod tests {
         assert_eq!(bpl, 12);
         assert_eq!(out[0], 0x01, "dot 0 stays in the LSB");
         assert!(out[1..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn eseries_trailing_pad_appends_blank_columns() {
+        // Mirror the trailing-pad math in transfer_page: a packed canvas of
+        // `n` columns at `bpl` bytes/col grows by ESERIES_TRAIL_PAD_DOTS columns
+        // of zeros, and num_cols grows to match. The pad must be exactly
+        // blank (so it feeds clean tape, not stray dots).
+        let bpl = 12usize; // 96-dot head
+        let n = 3usize;
+        let mut canvas = vec![0xAAu8; n * bpl]; // arbitrary non-zero content
+        let mut num_cols = n as u32;
+
+        let pad_cols = ESERIES_TRAIL_PAD_DOTS;
+        canvas.resize(canvas.len() + pad_cols as usize * bpl, 0);
+        num_cols += pad_cols;
+
+        assert_eq!(num_cols, n as u32 + ESERIES_TRAIL_PAD_DOTS);
+        assert_eq!(canvas.len(), (n + ESERIES_TRAIL_PAD_DOTS as usize) * bpl);
+        // Original content untouched; appended columns all zero.
+        assert!(canvas[..n * bpl].iter().all(|&b| b == 0xAA));
+        assert!(canvas[n * bpl..].iter().all(|&b| b == 0));
     }
 }
